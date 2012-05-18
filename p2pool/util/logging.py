@@ -20,9 +20,10 @@ class EncodeReplacerPipe(object):
         self.inner_file.flush()
 
 class LogFile(object):
-    def __init__(self, filename):
+    def __init__(self, filename, max_size = None):
         self.filename = filename
         self.inner_file = None
+        self.max_size = max_size
         self.reopen()
     def reopen(self):
         if self.inner_file is not None:
@@ -31,7 +32,7 @@ class LogFile(object):
         f = open(self.filename, 'rb')
         f.seek(0, os.SEEK_END)
         length = f.tell()
-        if length > 100*1000*1000:
+        if self.max_size and length > self.max_size:
             f.seek(-1000*1000, os.SEEK_END)
             while True:
                 if f.read(1) in ('', '\n'):
