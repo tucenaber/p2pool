@@ -71,8 +71,17 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                 raise deferral.RetrySilentlyException()
             defer.returnValue(temp_work)
         temp_work = yield check()
+        
+        block_height_var = variable.Variable(None)
+        @defer.inlineCallbacks
+        def poll_height():
+            block_height_var.set((yield deferral.retry('Error while calling getblockcount:')(bitcoind.rpc_getblockcount)()))
+        yield poll_height()
+        task.LoopingCall(poll_height).start(60*60)
+        
         print '    ...success!'
         print '    Current block hash: %x' % (temp_work['previous_block_hash'],)
+        print '    Current block height: %i' % (block_height_var.value,)
         print
         
         # connect to bitcoind over bitcoin-p2p
@@ -184,27 +193,26 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         # PEER WORK
         
         best_block_header = variable.Variable(None)
-        def handle_header(header):
+        def handle_header(new_header):
             # check that header matches current target
-            if not (net.PARENT.POW_FUNC(bitcoin_data.block_header_type.pack(header)) <= bitcoind_work.value['bits'].target):
+            if not (net.PARENT.POW_FUNC(bitcoin_data.block_header_type.pack(new_header)) <= bitcoind_work.value['bits'].target):
                 return
+            bitcoind_best_block = bitcoind_work.value['previous_block']
             if (best_block_header.value is None
                 or (
-                    header['previous_block'] == current_work.value['previous_block'] and
-                    bitcoin_data.hash256(bitcoin_data.block_header_type.pack(best_block_header.value)) == current_work.value['previous_block']
+                    new_header['previous_block'] == bitcoind_best_block and
+                    bitcoin_data.hash256(bitcoin_data.block_header_type.pack(best_block_header.value)) == bitcoind_best_block
                 ) # new is child of current and previous is current
                 or (
-                    bitcoin_data.hash256(bitcoin_data.block_header_type.pack(header)) == current_work.value['previous_block'] and
-                    best_block_header.value['previous_block'] != current_work.value['previous_block'])
-                ): # new is current and previous is not child of current
-                best_block_header.set(header)
-        @bitcoind_work.changed.watch
+                    bitcoin_data.hash256(bitcoin_data.block_header_type.pack(new_header)) == bitcoind_best_block and
+                    best_block_header.value['previous_block'] != bitcoind_best_block
+                )): # new is current and previous is not a child of current
+                best_block_header.set(new_header)
         @defer.inlineCallbacks
-        def _(work):
-            handle_header((yield factory.conn.value.get_block_header(work['previous_block'])))
-        @best_block_header.changed.watch
-        def _(header):
-            compute_work()
+        def poll_header():
+            handle_header((yield factory.conn.value.get_block_header(bitcoind_work.value['previous_block'])))
+        bitcoind_work.changed.watch(lambda _: poll_header())
+        yield poll_header()
         
         # MERGED WORK
         
@@ -253,7 +261,7 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                     time=best_block_header.value['timestamp'] + 600, # better way?
                     transactions=[],
                     merkle_link=bitcoin_data.calculate_merkle_link([0], 0),
-                    subsidy=5000000000, # XXX fix this
+                    subsidy=net.PARENT.SUBSIDY_FUNC(block_height_var.value),
                     clock_offset=current_work.value['clock_offset'],
                     last_update=current_work.value['last_update'],
                 )
@@ -291,6 +299,7 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                 requested[share_hash] = t, count + 1
         bitcoind_work.changed.watch(lambda _: compute_work())
         merged_work.changed.watch(lambda _: compute_work())
+        best_block_header.changed.watch(lambda _: compute_work())
         compute_work()
         
         # LONG POLLING
@@ -616,7 +625,7 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                                 'doa' if doas > doas_recorded_in_chain else
                                 None
                             )(*get_stale_counts()),
-                            desired_version=1,
+                            desired_version=3,
                         ),
                         block_target=current_work.value['bits'].target,
                         desired_timestamp=int(time.time() - current_work.value['clock_offset']),
