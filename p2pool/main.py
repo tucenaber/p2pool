@@ -2,7 +2,6 @@ from __future__ import division
 
 import ConfigParser
 import StringIO
-import argparse
 import base64
 import json
 import os
@@ -21,10 +20,10 @@ from twisted.web import server
 from twisted.python import log
 from nattraverso import portmapper, ipdiscover
 
-import bitcoin.p2p as bitcoin_p2p, bitcoin.getwork as bitcoin_getwork, bitcoin.data as bitcoin_data
+import bitcoin.p2p as bitcoin_p2p, bitcoin.data as bitcoin_data
 from bitcoin import worker_interface, height_tracker
-from util import expiring_dict, jsonrpc, variable, deferral, math, logging, pack
-from . import p2p, networks, web
+from util import expiring_dict, fixargparse, jsonrpc, variable, deferral, math, logging
+from . import p2p, networks, web, work
 import p2pool, p2pool.data as p2pool_data
 
 @deferral.retry('Error getting work from bitcoind:', 3)
@@ -40,13 +39,15 @@ def getwork(bitcoind):
     packed_transactions = [x.decode('hex') for x in work['transactions']]
     defer.returnValue(dict(
         version=work['version'],
-        previous_block_hash=int(work['previousblockhash'], 16),
+        previous_block=int(work['previousblockhash'], 16),
         transactions=map(bitcoin_data.tx_type.unpack, packed_transactions),
-        merkle_link=bitcoin_data.calculate_merkle_link([0] + map(bitcoin_data.hash256, packed_transactions), 0), # using 0 is a bit of a hack, but will always work when index=0
+        merkle_link=bitcoin_data.calculate_merkle_link([None] + map(bitcoin_data.hash256, packed_transactions), 0),
         subsidy=work['coinbasevalue'],
         time=work['time'],
         bits=bitcoin_data.FloatingIntegerType().unpack(work['bits'].decode('hex')[::-1]) if isinstance(work['bits'], (str, unicode)) else bitcoin_data.FloatingInteger(work['bits']),
         coinbaseflags=work['coinbaseflags'].decode('hex') if 'coinbaseflags' in work else ''.join(x.decode('hex') for x in work['coinbaseaux'].itervalues()) if 'coinbaseaux' in work else '',
+        clock_offset=time.time() - work['time'],
+        last_update=time.time(),
     ))
 
 @defer.inlineCallbacks
@@ -80,7 +81,7 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         task.LoopingCall(poll_height).start(60*60)
         
         print '    ...success!'
-        print '    Current block hash: %x' % (temp_work['previous_block_hash'],)
+        print '    Current block hash: %x' % (temp_work['previous_block'],)
         print '    Current block height: %i' % (block_height_var.value,)
         print
         
@@ -160,31 +161,13 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         
         # BITCOIND WORK
         
-        bitcoind_work = variable.Variable(None)
-        
-        @defer.inlineCallbacks
-        def poll_bitcoind():
-            work = yield getwork(bitcoind)
-            bitcoind_work.set(dict(
-                version=work['version'],
-                previous_block=work['previous_block_hash'],
-                bits=work['bits'],
-                coinbaseflags=work['coinbaseflags'],
-                time=work['time'],
-                transactions=work['transactions'],
-                merkle_link=work['merkle_link'],
-                subsidy=work['subsidy'],
-                clock_offset=time.time() - work['time'],
-                last_update=time.time(),
-            ))
-        yield poll_bitcoind()
-        
+        bitcoind_work = variable.Variable((yield getwork(bitcoind)))
         @defer.inlineCallbacks
         def work_poller():
             while True:
                 flag = factory.new_block.get_deferred()
                 try:
-                    yield poll_bitcoind()
+                    bitcoind_work.set((yield getwork(bitcoind)))
                 except:
                     log.err()
                 yield defer.DeferredList([flag, deferral.sleep(15)], fireOnOneCallback=True)
@@ -214,61 +197,17 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         bitcoind_work.changed.watch(lambda _: poll_header())
         yield poll_header()
         
-        # MERGED WORK
-        
-        merged_work = variable.Variable({})
-        
-        @defer.inlineCallbacks
-        def set_merged_work(merged_url, merged_userpass):
-            merged_proxy = jsonrpc.Proxy(merged_url, dict(Authorization='Basic ' + base64.b64encode(merged_userpass)))
-            while True:
-                auxblock = yield deferral.retry('Error while calling merged getauxblock:', 1)(merged_proxy.rpc_getauxblock)()
-                merged_work.set(dict(merged_work.value, **{auxblock['chainid']: dict(
-                    hash=int(auxblock['hash'], 16),
-                    target=pack.IntType(256).unpack(auxblock['target'].decode('hex')),
-                    merged_proxy=merged_proxy,
-                )}))
-                yield deferral.sleep(1)
-        for merged_url, merged_userpass in merged_urls:
-            set_merged_work(merged_url, merged_userpass)
-        
-        @merged_work.changed.watch
-        def _(new_merged_work):
-            print 'Got new merged mining work!'
-        
-        # COMBINE WORK
-        
-        current_work = variable.Variable(None)
+        # BEST SHARE
         
         get_height_rel_highest = yield height_tracker.get_height_rel_highest_func(bitcoind, factory, lambda: bitcoind_work.value['previous_block'], net)
         requested = expiring_dict.ExpiringDict(300)
         peer_heads = expiring_dict.ExpiringDict(300) # hash -> peers that know of it
-        def compute_work():
+        
+        best_share_var = variable.Variable(None)
+        def set_best_share():
             best, desired = tracker.think(get_height_rel_highest, bitcoind_work.value['previous_block'], bitcoind_work.value['bits'])
             
-            t = dict(bitcoind_work.value)
-            
-            if (best_block_header.value is not None and
-            best_block_header.value['previous_block'] == t['previous_block'] and
-            net.PARENT.POW_FUNC(bitcoin_data.block_header_type.pack(best_block_header.value)) <= t['bits'].target):
-                print 'Skipping from block %x to block %x!' % (best_block_header.value['previous_block'],
-                    bitcoin_data.hash256(bitcoin_data.block_header_type.pack(best_block_header.value)))
-                t = dict(
-                    version=best_block_header.value['version'],
-                    previous_block=bitcoin_data.hash256(bitcoin_data.block_header_type.pack(best_block_header.value)),
-                    bits=best_block_header.value['bits'], # not always true
-                    coinbaseflags='',
-                    time=best_block_header.value['timestamp'] + 600, # better way?
-                    transactions=[],
-                    merkle_link=bitcoin_data.calculate_merkle_link([0], 0),
-                    subsidy=net.PARENT.SUBSIDY_FUNC(block_height_var.value),
-                    clock_offset=current_work.value['clock_offset'],
-                    last_update=current_work.value['last_update'],
-                )
-            
-            t['best_share_hash'] = best
-            t['mm_chains'] = merged_work.value
-            current_work.set(t)
+            best_share_var.set(best)
             
             t = time.time()
             for peer2, share_hash in desired:
@@ -297,20 +236,8 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                     ))[:100],
                 )
                 requested[share_hash] = t, count + 1
-        bitcoind_work.changed.watch(lambda _: compute_work())
-        merged_work.changed.watch(lambda _: compute_work())
-        best_block_header.changed.watch(lambda _: compute_work())
-        compute_work()
-        
-        # LONG POLLING
-        
-        lp_signal = variable.Event()
-        
-        @current_work.transitioned.watch
-        def _(before, after):
-            # trigger LP if version/previous_block/bits changed or transactions changed from nothing
-            if any(before[x] != after[x] for x in ['version', 'previous_block', 'bits', 'best_share_hash', 'mm_chains']) or (not before['transactions'] and after['transactions']):
-                lp_signal.happened()
+        bitcoind_work.changed.watch(lambda _: set_best_share())
+        set_best_share()
         
         
         print '    ...success!'
@@ -339,7 +266,7 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                     peer_heads.setdefault(shares[0].hash, set()).add(peer)
                 
                 if new_count:
-                    compute_work()
+                    set_best_share()
                 
                 if len(shares) > 5:
                     print '... done processing %i shares. New: %i Have: %i/~%i' % (len(shares), new_count, len(tracker.shares), 2*net.CHAIN_LENGTH)
@@ -407,7 +334,7 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                 print
                 def spread():
                     if (get_height_rel_highest(share.header['previous_block']) > -5 or
-                        current_work.value['previous_block'] in [share.header['previous_block'], share.header_hash]):
+                        bitcoind_work.value['previous_block'] in [share.header['previous_block'], share.header_hash]):
                         broadcast_share(share.hash)
                 spread()
                 reactor.callLater(5, spread) # so get_height_rel_highest can update
@@ -429,11 +356,6 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                     addrs.update(dict((tuple(k), v) for k, v in json.loads(f.read())))
             except:
                 print >>sys.stderr, 'error parsing addrs'
-        elif os.path.exists(os.path.join(datadir_path, 'addrs.txt')):
-            try:
-                addrs.update(dict(eval(x) for x in open(os.path.join(datadir_path, 'addrs.txt'))))
-            except:
-                print >>sys.stderr, "error reading addrs.txt"
         for addr_df in map(parse, net.BOOTSTRAP_ADDRS):
             try:
                 addr = yield addr_df
@@ -450,7 +372,7 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                 log.err()
         
         p2p_node = Node(
-            best_share_hash_func=lambda: current_work.value['best_share_hash'],
+            best_share_hash_func=lambda: best_share_var.value,
             port=args.p2pool_port,
             net=net,
             addr_store=addrs,
@@ -481,10 +403,10 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                 peer.sendShares([share for share in shares if share.peer is not peer])
         
         # send share when the chain changes to their chain
-        current_work.changed.watch(lambda new_work: broadcast_share(new_work['best_share_hash']))
+        best_share_var.changed.watch(broadcast_share)
         
         def save_shares():
-            for share in tracker.get_chain(current_work.value['best_share_hash'], min(tracker.get_height(current_work.value['best_share_hash']), 2*net.CHAIN_LENGTH)):
+            for share in tracker.get_chain(best_share_var.value, min(tracker.get_height(best_share_var.value), 2*net.CHAIN_LENGTH)):
                 ss.add_share(share)
                 if share.hash in tracker.verified.shares:
                     ss.add_verified_hash(share.hash)
@@ -514,270 +436,11 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         
         print 'Listening for workers on %r port %i...' % (worker_endpoint[0], worker_endpoint[1])
         
-        # setup worker logic
+        get_current_txouts = lambda: p2pool_data.get_expected_payouts(tracker, best_share_var.value, bitcoind_work.value['bits'].target, bitcoind_work.value['subsidy'], net)
         
-        removed_unstales_var = variable.Variable((0, 0, 0))
-        removed_doa_unstales_var = variable.Variable(0)
-        @tracker.verified.removed.watch
-        def _(share):
-            if share.hash in my_share_hashes and tracker.is_child_of(share.hash, current_work.value['best_share_hash']):
-                assert share.share_data['stale_info'] in [None, 'orphan', 'doa'] # we made these shares in this instance
-                removed_unstales_var.set((
-                    removed_unstales_var.value[0] + 1,
-                    removed_unstales_var.value[1] + (1 if share.share_data['stale_info'] == 'orphan' else 0),
-                    removed_unstales_var.value[2] + (1 if share.share_data['stale_info'] == 'doa' else 0),
-                ))
-            if share.hash in my_doa_share_hashes and tracker.is_child_of(share.hash, current_work.value['best_share_hash']):
-                removed_doa_unstales_var.set(removed_doa_unstales_var.value + 1)
-        
-        def get_stale_counts():
-            '''Returns (orphans, doas), total, (orphans_recorded_in_chain, doas_recorded_in_chain)'''
-            my_shares = len(my_share_hashes)
-            my_doa_shares = len(my_doa_share_hashes)
-            delta = tracker.verified.get_delta_to_last(current_work.value['best_share_hash'])
-            my_shares_in_chain = delta.my_count + removed_unstales_var.value[0]
-            my_doa_shares_in_chain = delta.my_doa_count + removed_doa_unstales_var.value
-            orphans_recorded_in_chain = delta.my_orphan_announce_count + removed_unstales_var.value[1]
-            doas_recorded_in_chain = delta.my_dead_announce_count + removed_unstales_var.value[2]
-            
-            my_shares_not_in_chain = my_shares - my_shares_in_chain
-            my_doa_shares_not_in_chain = my_doa_shares - my_doa_shares_in_chain
-            
-            return (my_shares_not_in_chain - my_doa_shares_not_in_chain, my_doa_shares_not_in_chain), my_shares, (orphans_recorded_in_chain, doas_recorded_in_chain)
-        
-        
-        pseudoshare_received = variable.Event()
-        share_received = variable.Event()
-        local_rate_monitor = math.RateMonitor(10*60)
-        
-        class WorkerBridge(worker_interface.WorkerBridge):
-            def __init__(self):
-                worker_interface.WorkerBridge.__init__(self)
-                self.new_work_event = lp_signal
-                self.recent_shares_ts_work = []
-            
-            def get_user_details(self, request):
-                user = request.getUser() if request.getUser() is not None else ''
-                
-                desired_pseudoshare_target = None
-                if '+' in user:
-                    user, desired_pseudoshare_difficulty_str = user.rsplit('+', 1)
-                    try:
-                        desired_pseudoshare_target = bitcoin_data.difficulty_to_target(float(desired_pseudoshare_difficulty_str))
-                    except:
-                        pass
-                
-                desired_share_target = 2**256 - 1
-                if '/' in user:
-                    user, min_diff_str = user.rsplit('/', 1)
-                    try:
-                        desired_share_target = bitcoin_data.difficulty_to_target(float(min_diff_str))
-                    except:
-                        pass
-                
-                if random.uniform(0, 100) < args.worker_fee:
-                    pubkey_hash = my_pubkey_hash
-                else:
-                    try:
-                        pubkey_hash = bitcoin_data.address_to_pubkey_hash(user, net.PARENT)
-                    except: # XXX blah
-                        pubkey_hash = my_pubkey_hash
-                
-                return user, pubkey_hash, desired_share_target, desired_pseudoshare_target
-            
-            def preprocess_request(self, request):
-                user, pubkey_hash, desired_share_target, desired_pseudoshare_target = self.get_user_details(request)
-                return pubkey_hash, desired_share_target, desired_pseudoshare_target
-            
-            def get_work(self, pubkey_hash, desired_share_target, desired_pseudoshare_target):
-                if len(p2p_node.peers) == 0 and net.PERSIST:
-                    raise jsonrpc.Error(-12345, u'p2pool is not connected to any peers')
-                if current_work.value['best_share_hash'] is None and net.PERSIST:
-                    raise jsonrpc.Error(-12345, u'p2pool is downloading shares')
-                if time.time() > current_work.value['last_update'] + 60:
-                    raise jsonrpc.Error(-12345, u'lost contact with bitcoind')
-                
-                if current_work.value['mm_chains']:
-                    tree, size = bitcoin_data.make_auxpow_tree(current_work.value['mm_chains'])
-                    mm_hashes = [current_work.value['mm_chains'].get(tree.get(i), dict(hash=0))['hash'] for i in xrange(size)]
-                    mm_data = '\xfa\xbemm' + bitcoin_data.aux_pow_coinbase_type.pack(dict(
-                        merkle_root=bitcoin_data.merkle_hash(mm_hashes),
-                        size=size,
-                        nonce=0,
-                    ))
-                    mm_later = [(aux_work, mm_hashes.index(aux_work['hash']), mm_hashes) for chain_id, aux_work in current_work.value['mm_chains'].iteritems()]
-                else:
-                    mm_data = ''
-                    mm_later = []
-                
-                if True:
-                    share_info, generate_tx = p2pool_data.Share.generate_transaction(
-                        tracker=tracker,
-                        share_data=dict(
-                            previous_share_hash=current_work.value['best_share_hash'],
-                            coinbase=(mm_data + current_work.value['coinbaseflags'])[:100],
-                            nonce=random.randrange(2**32),
-                            pubkey_hash=pubkey_hash,
-                            subsidy=current_work.value['subsidy'],
-                            donation=math.perfect_round(65535*args.donation_percentage/100),
-                            stale_info=(lambda (orphans, doas), total, (orphans_recorded_in_chain, doas_recorded_in_chain):
-                                'orphan' if orphans > orphans_recorded_in_chain else
-                                'doa' if doas > doas_recorded_in_chain else
-                                None
-                            )(*get_stale_counts()),
-                            desired_version=3,
-                        ),
-                        block_target=current_work.value['bits'].target,
-                        desired_timestamp=int(time.time() - current_work.value['clock_offset']),
-                        desired_target=desired_share_target,
-                        ref_merkle_link=dict(branch=[], index=0),
-                        net=net,
-                    )
-                
-                if desired_pseudoshare_target is None:
-                    target = 2**256-1
-                    if len(self.recent_shares_ts_work) == 50:
-                        hash_rate = sum(work for ts, work in self.recent_shares_ts_work[1:])//(self.recent_shares_ts_work[-1][0] - self.recent_shares_ts_work[0][0])
-                        if hash_rate:
-                            target = min(target, int(2**256/hash_rate))
-                else:
-                    target = desired_pseudoshare_target
-                target = max(target, share_info['bits'].target)
-                for aux_work in current_work.value['mm_chains'].itervalues():
-                    target = max(target, aux_work['target'])
-                target = math.clip(target, net.PARENT.SANE_TARGET_RANGE)
-                
-                transactions = [generate_tx] + list(current_work.value['transactions'])
-                packed_generate_tx = bitcoin_data.tx_type.pack(generate_tx)
-                merkle_root = bitcoin_data.check_merkle_link(bitcoin_data.hash256(packed_generate_tx), current_work.value['merkle_link'])
-                
-                getwork_time = time.time()
-                merkle_link = current_work.value['merkle_link']
-                
-                print 'New work for worker! Difficulty: %.06f Share difficulty: %.06f Total block value: %.6f %s including %i transactions' % (
-                    bitcoin_data.target_to_difficulty(target),
-                    bitcoin_data.target_to_difficulty(share_info['bits'].target),
-                    current_work.value['subsidy']*1e-8, net.PARENT.SYMBOL,
-                    len(current_work.value['transactions']),
-                )
-                
-                bits = current_work.value['bits']
-                previous_block = current_work.value['previous_block']
-                ba = bitcoin_getwork.BlockAttempt(
-                    version=current_work.value['version'],
-                    previous_block=current_work.value['previous_block'],
-                    merkle_root=merkle_root,
-                    timestamp=current_work.value['time'],
-                    bits=current_work.value['bits'],
-                    share_target=target,
-                )
-                
-                received_header_hashes = set()
-                
-                def got_response(header, request):
-                    header_hash = bitcoin_data.hash256(bitcoin_data.block_header_type.pack(header))
-                    pow_hash = net.PARENT.POW_FUNC(bitcoin_data.block_header_type.pack(header))
-                    try:
-                        if pow_hash <= header['bits'].target or p2pool.DEBUG:
-                            submit_block(dict(header=header, txs=transactions), ignore_failure=False)
-                            if pow_hash <= header['bits'].target:
-                                print
-                                print 'GOT BLOCK FROM MINER! Passing to bitcoind! %s%064x' % (net.PARENT.BLOCK_EXPLORER_URL_PREFIX, header_hash)
-                                print
-                    except:
-                        log.err(None, 'Error while processing potential block:')
-                    
-                    user, _, _, _ = self.get_user_details(request)
-                    assert header['merkle_root'] == merkle_root
-                    assert header['previous_block'] == previous_block
-                    assert header['bits'] == bits
-                    
-                    on_time = current_work.value['best_share_hash'] == share_info['share_data']['previous_share_hash']
-                    
-                    for aux_work, index, hashes in mm_later:
-                        try:
-                            if pow_hash <= aux_work['target'] or p2pool.DEBUG:
-                                df = deferral.retry('Error submitting merged block: (will retry)', 10, 10)(aux_work['merged_proxy'].rpc_getauxblock)(
-                                    pack.IntType(256, 'big').pack(aux_work['hash']).encode('hex'),
-                                    bitcoin_data.aux_pow_type.pack(dict(
-                                        merkle_tx=dict(
-                                            tx=transactions[0],
-                                            block_hash=header_hash,
-                                            merkle_link=merkle_link,
-                                        ),
-                                        merkle_link=bitcoin_data.calculate_merkle_link(hashes, index),
-                                        parent_block_header=header,
-                                    )).encode('hex'),
-                                )
-                                @df.addCallback
-                                def _(result):
-                                    if result != (pow_hash <= aux_work['target']):
-                                        print >>sys.stderr, 'Merged block submittal result: %s Expected: %s' % (result, pow_hash <= aux_work['target'])
-                                    else:
-                                        print 'Merged block submittal result: %s' % (result,)
-                                @df.addErrback
-                                def _(err):
-                                    log.err(err, 'Error submitting merged block:')
-                        except:
-                            log.err(None, 'Error while processing merged mining POW:')
-                    
-                    if pow_hash <= share_info['bits'].target and header_hash not in received_header_hashes:
-                        min_header = dict(header);del min_header['merkle_root']
-                        hash_link = p2pool_data.prefix_to_hash_link(packed_generate_tx[:-32-4], p2pool_data.Share.gentx_before_refhash)
-                        share = p2pool_data.Share(net, None, dict(
-                            min_header=min_header, share_info=share_info, hash_link=hash_link,
-                            ref_merkle_link=dict(branch=[], index=0),
-                        ), merkle_link=merkle_link, other_txs=transactions[1:] if pow_hash <= header['bits'].target else None)
-                        
-                        print 'GOT SHARE! %s %s prev %s age %.2fs%s' % (
-                            request.getUser(),
-                            p2pool_data.format_hash(share.hash),
-                            p2pool_data.format_hash(share.previous_hash),
-                            time.time() - getwork_time,
-                            ' DEAD ON ARRIVAL' if not on_time else '',
-                        )
-                        my_share_hashes.add(share.hash)
-                        if not on_time:
-                            my_doa_share_hashes.add(share.hash)
-                        
-                        tracker.add(share)
-                        if not p2pool.DEBUG:
-                            tracker.verified.add(share)
-                        compute_work()
-                        
-                        try:
-                            if pow_hash <= header['bits'].target or p2pool.DEBUG:
-                                for peer in p2p_node.peers.itervalues():
-                                    peer.sendShares([share])
-                                shared_share_hashes.add(share.hash)
-                        except:
-                            log.err(None, 'Error forwarding block solution:')
-                        
-                        share_received.happened(bitcoin_data.target_to_average_attempts(share.target), not on_time)
-                    
-                    if pow_hash > target:
-                        print 'Worker %s submitted share with hash > target:' % (request.getUser(),)
-                        print '    Hash:   %56x' % (pow_hash,)
-                        print '    Target: %56x' % (target,)
-                    elif header_hash in received_header_hashes:
-                        print >>sys.stderr, 'Worker %s @ %s submitted share more than once!' % (request.getUser(), request.getClientIP())
-                    else:
-                        received_header_hashes.add(header_hash)
-                        
-                        pseudoshare_received.happened(bitcoin_data.target_to_average_attempts(target), not on_time, user)
-                        self.recent_shares_ts_work.append((time.time(), bitcoin_data.target_to_average_attempts(target)))
-                        while len(self.recent_shares_ts_work) > 50:
-                            self.recent_shares_ts_work.pop(0)
-                        local_rate_monitor.add_datum(dict(work=bitcoin_data.target_to_average_attempts(target), dead=not on_time, user=user))
-                    
-                    return on_time
-                
-                return ba, got_response
-        
-        get_current_txouts = lambda: p2pool_data.get_expected_payouts(tracker, current_work.value['best_share_hash'], current_work.value['bits'].target, current_work.value['subsidy'], net)
-        
-        web_root = web.get_web_root(tracker, current_work, get_current_txouts, datadir_path, net, get_stale_counts, my_pubkey_hash, local_rate_monitor, args.worker_fee, p2p_node, my_share_hashes, pseudoshare_received, share_received)
-        worker_interface.WorkerInterface(WorkerBridge()).attach_to(web_root, get_handler=lambda request: request.redirect('/static/'))
+        wb = work.WorkerBridge(my_pubkey_hash, net, args.donation_percentage, bitcoind_work, best_block_header, merged_urls, best_share_var, tracker, my_share_hashes, my_doa_share_hashes, args.worker_fee, p2p_node, submit_block, set_best_share, shared_share_hashes, block_height_var)
+        web_root = web.get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, wb.get_stale_counts, my_pubkey_hash, wb.local_rate_monitor, args.worker_fee, p2p_node, wb.my_share_hashes, wb.pseudoshare_received, wb.share_received, best_share_var)
+        worker_interface.WorkerInterface(wb).attach_to(web_root, get_handler=lambda request: request.redirect('/static/'))
         
         deferral.retry('Error binding to worker port:', traceback=False)(reactor.listenTCP)(worker_endpoint[1], server.Site(web_root), interface=worker_endpoint[0])
         
@@ -852,10 +515,10 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
             while True:
                 yield deferral.sleep(3)
                 try:
-                    if time.time() > current_work.value['last_update'] + 60:
-                        print >>sys.stderr, '''---> LOST CONTACT WITH BITCOIND for %s! Check that it isn't frozen or dead! <---''' % (math.format_dt(time.time() - current_work.value['last_update']),)
+                    if time.time() > bitcoind_work.value['last_update'] + 60:
+                        print >>sys.stderr, '''---> LOST CONTACT WITH BITCOIND for %s! Check that it isn't frozen or dead! <---''' % (math.format_dt(time.time() - bitcoind_work.value['last_update']),)
                     
-                    height = tracker.get_height(current_work.value['best_share_hash'])
+                    height = tracker.get_height(best_share_var.value)
                     this_str = 'P2Pool: %i shares in chain (%i verified/%i total) Peers: %i (%i incoming)' % (
                         height,
                         len(tracker.verified.shares),
@@ -864,19 +527,19 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                         sum(1 for peer in p2p_node.peers.itervalues() if peer.incoming),
                     ) + (' FDs: %i R/%i W' % (len(reactor.getReaders()), len(reactor.getWriters())) if p2pool.DEBUG else '')
                     
-                    datums, dt = local_rate_monitor.get_datums_in_last()
+                    datums, dt = wb.local_rate_monitor.get_datums_in_last()
                     my_att_s = sum(datum['work']/dt for datum in datums)
                     this_str += '\n Local: %sH/s in last %s Local dead on arrival: %s Expected time to share: %s' % (
                         math.format(int(my_att_s)),
                         math.format_dt(dt),
                         math.format_binomial_conf(sum(1 for datum in datums if datum['dead']), len(datums), 0.95),
-                        math.format_dt(2**256 / tracker.shares[current_work.value['best_share_hash']].max_target / my_att_s) if my_att_s and current_work.value['best_share_hash'] else '???',
+                        math.format_dt(2**256 / tracker.shares[best_share_var.value].max_target / my_att_s) if my_att_s and best_share_var.value else '???',
                     )
                     
                     if height > 2:
-                        (stale_orphan_shares, stale_doa_shares), shares, _ = get_stale_counts()
-                        stale_prop = p2pool_data.get_average_stale_prop(tracker, current_work.value['best_share_hash'], min(60*60//net.SHARE_PERIOD, height))
-                        real_att_s = p2pool_data.get_pool_attempts_per_second(tracker, current_work.value['best_share_hash'], min(height - 1, 60*60//net.SHARE_PERIOD)) / (1 - stale_prop)
+                        (stale_orphan_shares, stale_doa_shares), shares, _ = wb.get_stale_counts()
+                        stale_prop = p2pool_data.get_average_stale_prop(tracker, best_share_var.value, min(60*60//net.SHARE_PERIOD, height))
+                        real_att_s = p2pool_data.get_pool_attempts_per_second(tracker, best_share_var.value, min(height - 1, 60*60//net.SHARE_PERIOD)) / (1 - stale_prop)
                         
                         this_str += '\n Shares: %i (%i orphan, %i dead) Stale rate: %s Efficiency: %s Current payout: %.4f %s' % (
                             shares, stale_orphan_shares, stale_doa_shares,
@@ -887,10 +550,10 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                         this_str += '\n Pool: %sH/s Stale rate: %.1f%% Expected time to block: %s' % (
                             math.format(int(real_att_s)),
                             100*stale_prop,
-                            math.format_dt(2**256 / current_work.value['bits'].target / real_att_s),
+                            math.format_dt(2**256 / bitcoind_work.value['bits'].target / real_att_s),
                         )
                         
-                        for warning in p2pool_data.get_warnings(tracker, current_work, net):
+                        for warning in p2pool_data.get_warnings(tracker, best_share_var.value, net):
                             print >>sys.stderr, '#'*40
                             print >>sys.stderr, '>>> Warning: ' + warning
                             print >>sys.stderr, '#'*40
@@ -907,43 +570,9 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         log.err(None, 'Fatal error:')
 
 def run():
-    class FixedArgumentParser(argparse.ArgumentParser):
-        def _read_args_from_files(self, arg_strings):
-            # expand arguments referencing files
-            new_arg_strings = []
-            for arg_string in arg_strings:
-                
-                # for regular arguments, just add them back into the list
-                if not arg_string or arg_string[0] not in self.fromfile_prefix_chars:
-                    new_arg_strings.append(arg_string)
-                
-                # replace arguments referencing files with the file content
-                else:
-                    try:
-                        args_file = open(arg_string[1:])
-                        try:
-                            arg_strings = []
-                            for arg_line in args_file.read().splitlines():
-                                for arg in self.convert_arg_line_to_args(arg_line):
-                                    arg_strings.append(arg)
-                            arg_strings = self._read_args_from_files(arg_strings)
-                            new_arg_strings.extend(arg_strings)
-                        finally:
-                            args_file.close()
-                    except IOError:
-                        err = sys.exc_info()[1]
-                        self.error(str(err))
-            
-            # return the modified argument list
-            return new_arg_strings
-        
-        def convert_arg_line_to_args(self, arg_line):
-            return [arg for arg in arg_line.split() if arg.strip()]
+    realnets = dict((name, net) for name, net in networks.nets.iteritems() if '_testnet' not in name)
     
-    
-    realnets=dict((name, net) for name, net in networks.nets.iteritems() if '_testnet' not in name)
-    
-    parser = FixedArgumentParser(description='p2pool (version %s)' % (p2pool.__version__,), fromfile_prefix_chars='@')
+    parser = fixargparse.FixedArgumentParser(description='p2pool (version %s)' % (p2pool.__version__,), fromfile_prefix_chars='@')
     parser.add_argument('--version', action='version', version=p2pool.__version__)
     parser.add_argument('--net',
         help='use specified network (default: bitcoin)',
