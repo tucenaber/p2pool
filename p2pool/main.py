@@ -339,6 +339,17 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                 spread()
                 reactor.callLater(5, spread) # so get_height_rel_highest can update
         
+        def track_pseudo_shares():
+            @tracker.added.watch
+            def _(share):
+                try:
+                    d = bitcoin_data.target_to_difficulty(share.share_info['bits'].target)
+                    n = wb.pseudoshare_received.times
+                    print '+++++++ Share +++++++  difficulty: %.4f share_count: %d' % (d, n)
+                except Exception:
+                    log.err()
+        track_pseudo_shares()
+
         print 'Joining p2pool network using port %i...' % (args.p2pool_port,)
         
         @defer.inlineCallbacks
