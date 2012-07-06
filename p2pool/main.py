@@ -22,7 +22,7 @@ from nattraverso import portmapper, ipdiscover
 
 import bitcoin.p2p as bitcoin_p2p, bitcoin.data as bitcoin_data
 from bitcoin import worker_interface, height_tracker
-from util import expiring_dict, fixargparse, jsonrpc, variable, deferral, math, logging
+from util import expiring_dict, fixargparse, jsonrpc, variable, deferral, math, logging, sharelog
 from . import p2p, networks, web, work
 import p2pool, p2pool.data as p2pool_data
 
@@ -339,17 +339,6 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                 spread()
                 reactor.callLater(5, spread) # so get_height_rel_highest can update
         
-        def track_pseudo_shares():
-            @tracker.added.watch
-            def _(share):
-                try:
-                    d = bitcoin_data.target_to_difficulty(share.share_info['bits'].target)
-                    n = wb.pseudoshare_received.times
-                    print '+++++++ Share +++++++  difficulty: %.4f share_count: %d' % (d, n)
-                except Exception:
-                    log.err()
-        track_pseudo_shares()
-
         print 'Joining p2pool network using port %i...' % (args.p2pool_port,)
         
         @defer.inlineCallbacks
@@ -454,6 +443,8 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         worker_interface.WorkerInterface(wb).attach_to(web_root, get_handler=lambda request: request.redirect('/static/'))
         
         deferral.retry('Error binding to worker port:', traceback=False)(reactor.listenTCP)(worker_endpoint[1], server.Site(web_root), interface=worker_endpoint[0])
+
+        sharelog.PseudoShareTracker().track(wb, logging.TimestampingPipe(logging.LogFile(os.path.join(datadir_path, 'sharelog'))))
         
         with open(os.path.join(os.path.join(datadir_path, 'ready_flag')), 'wb') as f:
             pass
