@@ -14,9 +14,7 @@ class Counter:
         self.count = 0
         self.start = 0
     def incr(self):
-        if not self.active: raise Exception()
-        if self.active:
-            self.count += 1
+        self.count += 1
     def deactivate(self):
         self.active = False
     def activate(self, t):
