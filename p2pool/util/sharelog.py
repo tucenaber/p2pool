@@ -59,19 +59,19 @@ class PseudoShareTracker:
             share_dflty = bitcoin_data.target_to_difficulty(share.share_info['bits'].target)
             block_dflty = bitcoin_data.target_to_difficulty(share.header['bits'].target)
 
-            logfile.write('%.6f share share:%s hash:%064x diff:%.8f diff:%.8f acc:%d rej:%d n:%d b:%d\n' % (
+            logfile.write('%.6f share share:%s hash:%064x ds:%.8f db:%.8f acc:%d rej:%d own:%d block:%d\n' % (
                 timestamp, p2pool_data.format_hash(share.hash), share.pow_hash, share_dflty, block_dflty, self.count_accepted.count, self.count_rejected.count, self.count_in_my_share.count, self.count_in_block.count))
             self.count_in_current.deactivate()
 
             if share.hash in wb.my_share_hashes:
                 #age = timestamp - my_share_data.start
-                logfile.write('%.6f mined share:%s diff:%.8f n:%d b:%d\n' % (
+                logfile.write('%.6f mined share:%s db:%.8f own:%d block:%d\n' % (
                     timestamp, p2pool_data.format_hash(share.hash), block_dflty, self.count_in_my_share.count, self.count_in_block.count))
                 self.count_in_my_share.deactivate()
 
             if share.pow_hash <= share.header['bits'].target:
                 #age = timestamp - block_data.start
-                logfile.write('%.6f block share:%s diff:%.8f n:%d b:%d pay:%.8f subsidy:%.8f\n' % (
+                logfile.write('%.6f block share:%s db:%.8f own:%d block:%d pay:%.8f subsidy:%.8f\n' % (
                     timestamp, p2pool_data.format_hash(share.hash), block_dflty, self.count_in_my_share.count, self.count_in_block.count,
                     get_current_txouts().get(bitcoin_data.pubkey_hash_to_script2(wb.my_pubkey_hash), 0)*1e-8, wb.current_work.value['subsidy']*1e-8))
                 self.count_in_block.deactivate()
