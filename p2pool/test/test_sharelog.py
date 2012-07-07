@@ -34,7 +34,7 @@ class MockWorkerBridge:
         self.my_pubkey_hash = 0
 
 class MockShare:
-    def __init__(self, share_hash=0, pow_hash=0x10000<<208, share_target=0xffff<<208, block_target=0xffff<<200, ):
+    def __init__(self, share_hash, pow_hash=0x10000<<208, share_target=0xffff<<208, block_target=0xffff<<200, ):
         self.share_info = {'bits':bitcoin_data.FloatingInteger.from_target_upper_bound(share_target)}
         self.header = {'bits':bitcoin_data.FloatingInteger.from_target_upper_bound(block_target)}
         self.hash = share_hash 
@@ -88,27 +88,49 @@ class LoggerTestCase(unittest.TestCase):
 
         self.wb.pseudoshare_received.happened(0.0, True, 'tester')
         self.wb.pseudoshare_received.happened(0.0, False, 'tester')
-        share = MockShare()
+        share = MockShare(0)
         self.wb.tracker.verified.added.happened(share)
+
+        self.assertEqual(1,self.pseudotracker.count_accepted.count) 
+        self.assertEqual(1,self.pseudotracker.count_in_current.count)
+        self.assertEqual(1,self.pseudotracker.count_in_my_share.count)
+        self.assertEqual(1,self.pseudotracker.count_in_block.count)
 
         self.wb.new_work_event.happened()
 
         self.wb.pseudoshare_received.happened(0.0, True, 'tester')
         self.wb.pseudoshare_received.happened(0.0, False, 'tester')
-        share = MockShare()
+        share = MockShare(1)
         self.wb.my_share_hashes.add(share.hash)
         self.wb.tracker.verified.added.happened(share)
 
+        self.assertEqual(2,self.pseudotracker.count_accepted.count) 
+        self.assertEqual(1,self.pseudotracker.count_in_current.count)
+        self.assertEqual(2,self.pseudotracker.count_in_my_share.count)
+        self.assertEqual(2,self.pseudotracker.count_in_block.count)
+
         self.wb.new_work_event.happened()
 
         self.wb.pseudoshare_received.happened(0.0, True, 'tester')
         self.wb.pseudoshare_received.happened(0.0, False, 'tester')
-        share = MockShare( pow_hash = 0 )
+        share = MockShare( 2,pow_hash = 0 )
         self.wb.tracker.verified.added.happened(share)
 
         self.assertEqual(3,self.pseudotracker.count_accepted.count) 
         self.assertEqual(1,self.pseudotracker.count_in_current.count)
         self.assertEqual(1,self.pseudotracker.count_in_my_share.count)
+        self.assertEqual(3,self.pseudotracker.count_in_block.count)
+
+        self.wb.new_work_event.happened()
+
+        self.wb.pseudoshare_received.happened(0.0, True, 'tester')
+        self.wb.pseudoshare_received.happened(0.0, False, 'tester')
+        share = MockShare(3)
+        self.wb.tracker.verified.added.happened(share)
+
+        self.assertEqual(4,self.pseudotracker.count_accepted.count) 
+        self.assertEqual(1,self.pseudotracker.count_in_current.count)
+        self.assertEqual(2,self.pseudotracker.count_in_my_share.count)
         self.assertEqual(1,self.pseudotracker.count_in_block.count)
         #self.assertEqual(['1341602883.753726 share share:00000000 shared_dflty:1.00000000 block_dflty:256.00000000 pseudo:\n'], self.log.buffer)
 
