@@ -63,8 +63,8 @@ class PseudoShareTracker:
 
             if share.hash in wb.my_share_hashes:
                 #age = timestamp - my_share_data.start
-                logfile.write('%.6f mined share:%s db:%.8f own:%d block:%d\n' % (
-                    timestamp, p2pool_data.format_hash(share.hash), block_dflty, self.count_in_my_share.count, self.count_in_block.count))
+                logfile.write('%.6f mined share:%s hash:%064x ds:%.8f db:%.8f own:%d block:%d\n' % (
+                    timestamp, p2pool_data.format_hash(share.hash), share.pow_hash, share_dflty, block_dflty, self.count_in_my_share.count, self.count_in_block.count))
                 self.count_in_my_share.deactivate()
 
             if share.pow_hash <= share.header['bits'].target:
