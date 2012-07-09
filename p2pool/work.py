@@ -35,6 +35,7 @@ class WorkerBridge(worker_interface.WorkerBridge):
         self.block_height_var = block_height_var
         
         self.pseudoshare_received = variable.Event()
+        self.pseudoshare_event = variable.Event()
         self.share_received = variable.Event()
         self.local_rate_monitor = math.RateMonitor(10*60)
         
@@ -266,6 +267,8 @@ class WorkerBridge(worker_interface.WorkerBridge):
             
             on_time = self.new_work_event.times == lp_count
             
+            duplicate = header_hash in received_header_hashes
+
             for aux_work, index, hashes in mm_later:
                 try:
                     if pow_hash <= aux_work['target'] or p2pool.DEBUG:
@@ -332,11 +335,13 @@ class WorkerBridge(worker_interface.WorkerBridge):
                 print '    Hash:   %56x' % (pow_hash,)
                 print '    Target: %56x' % (target,)
             elif header_hash in received_header_hashes:
-                print >>sys.stderr, 'Worker %s @ %s submitted share more than once!' % (request.getUser(), request.getClientIP())
+                print >>sys.stderr, 'Worker %s @ %s submitted share %064x more than once!' % (request.getUser(), request.getClientIP(), header_hash)
+                self.pseudoshare_event.happened(header_hash, not on_time, duplicate, user)
             else:
                 received_header_hashes.add(header_hash)
                 
                 self.pseudoshare_received.happened(bitcoin_data.target_to_average_attempts(target), not on_time, user)
+                self.pseudoshare_event.happened(header_hash, not on_time, duplicate, user)
                 self.recent_shares_ts_work.append((time.time(), bitcoin_data.target_to_average_attempts(target)))
                 while len(self.recent_shares_ts_work) > 50:
                     self.recent_shares_ts_work.pop(0)

@@ -23,7 +23,7 @@ class MockTracker:
 class MockWorkerBridge:
     net = networks.nets['bitcoin']
     def __init__(self):
-        self.pseudoshare_received = variable.Event()
+        self.pseudoshare_event = variable.Event()
         self.new_work_event = variable.Event()
         self.current_work = variable.Variable(None)
         self.my_share_hashes = set()
@@ -34,11 +34,19 @@ class MockWorkerBridge:
         self.my_pubkey_hash = 0
 
 class MockShare:
-    def __init__(self, share_hash, pow_hash=0x10000<<208, share_target=0xffff<<208, block_target=0xffff<<200, ):
-        self.share_info = {'bits':bitcoin_data.FloatingInteger.from_target_upper_bound(share_target)}
+    def __init__(self, share_hash, prev_hash=0, pow_hash=0x10000<<208, share_target=0xffff<<208, block_target=0xffff<<200, ):
+        self.share_info = {
+            'bits':bitcoin_data.FloatingInteger.from_target_upper_bound(share_target),
+            'share_data':{
+                'subsidy':5000000000
+            }
+        }
         self.header = {'bits':bitcoin_data.FloatingInteger.from_target_upper_bound(block_target)}
         self.hash = share_hash 
+        self.previous_hash = prev_hash 
         self.pow_hash = pow_hash
+    def check(self, tracker):
+        return {}
 
 #class DataTestCase(unittest.TestCase):
 #    def setUp(self):
@@ -71,13 +79,13 @@ class LoggerTestCase(unittest.TestCase):
     def testGoodPseudoShareEvent(self):
         self.pseudotracker.track(self.wb, self.log)
         self.wb.new_work_event.happened()
-        self.wb.pseudoshare_received.happened(0.0, True, 'tester')
+        self.wb.pseudoshare_event.happened(0, True, False, 'tester')
         self.assertEqual(0,self.pseudotracker.count_accepted.count) 
         self.assertEqual(1,self.pseudotracker.count_rejected.count) 
     def testBadPseudoShareEvent(self):
         self.pseudotracker.track(self.wb, self.log)
         self.wb.new_work_event.happened()
-        self.wb.pseudoshare_received.happened(0.0, False, 'tester')
+        self.wb.pseudoshare_event.happened(0, False, False, 'tester')
         self.assertEqual(1,self.pseudotracker.count_accepted.count) 
         self.assertEqual(0,self.pseudotracker.count_rejected.count) 
     def testNewShare(self):
@@ -86,8 +94,8 @@ class LoggerTestCase(unittest.TestCase):
 
         self.wb.new_work_event.happened()
 
-        self.wb.pseudoshare_received.happened(0.0, True, 'tester')
-        self.wb.pseudoshare_received.happened(0.0, False, 'tester')
+        self.wb.pseudoshare_event.happened(0, True, False, 'tester')
+        self.wb.pseudoshare_event.happened(0, False, False, 'tester')
         share = MockShare(0)
         self.wb.tracker.verified.added.happened(share)
 
@@ -98,8 +106,8 @@ class LoggerTestCase(unittest.TestCase):
 
         self.wb.new_work_event.happened()
 
-        self.wb.pseudoshare_received.happened(0.0, True, 'tester')
-        self.wb.pseudoshare_received.happened(0.0, False, 'tester')
+        self.wb.pseudoshare_event.happened(0, True, False, 'tester')
+        self.wb.pseudoshare_event.happened(0, False, False, 'tester')
         share = MockShare(1)
         self.wb.my_share_hashes.add(share.hash)
         self.wb.tracker.verified.added.happened(share)
@@ -111,8 +119,8 @@ class LoggerTestCase(unittest.TestCase):
 
         self.wb.new_work_event.happened()
 
-        self.wb.pseudoshare_received.happened(0.0, True, 'tester')
-        self.wb.pseudoshare_received.happened(0.0, False, 'tester')
+        self.wb.pseudoshare_event.happened(0, True, False, 'tester')
+        self.wb.pseudoshare_event.happened(0, False, False, 'tester')
         share = MockShare( 2,pow_hash = 0 )
         self.wb.tracker.verified.added.happened(share)
 
@@ -123,8 +131,8 @@ class LoggerTestCase(unittest.TestCase):
 
         self.wb.new_work_event.happened()
 
-        self.wb.pseudoshare_received.happened(0.0, True, 'tester')
-        self.wb.pseudoshare_received.happened(0.0, False, 'tester')
+        self.wb.pseudoshare_event.happened(0, True, False, 'tester')
+        self.wb.pseudoshare_event.happened(0, False, False, 'tester')
         share = MockShare(3)
         self.wb.tracker.verified.added.happened(share)
 
