@@ -6,14 +6,14 @@ import os
 import sys
 import time
 
-from twisted.internet import task
+from twisted.internet import defer, task
 from twisted.python import log
 from twisted.web import resource, static
 
 import p2pool
 from bitcoin import data as bitcoin_data
 from . import data as p2pool_data
-from util import graph, math
+from util import deferred_resource, graph, math
 
 def _atomic_read(filename):
     try:
@@ -111,7 +111,7 @@ def get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, 
             pool_nonstale_hash_rate=nonstale_hash_rate,
             pool_hash_rate=nonstale_hash_rate/(1 - stale_prop),
             pool_stale_prop=stale_prop,
-            min_difficulty=bitcoin_data.target_to_difficulty(tracker.shares[best_share_var.value].max_target),
+            min_difficulty=bitcoin_data.target_to_difficulty(tracker.items[best_share_var.value].max_target),
         )
     
     def get_local_stats():
@@ -132,8 +132,8 @@ def get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, 
         my_work = sum(bitcoin_data.target_to_average_attempts(share.target)
             for share in tracker.get_chain(best_share_var.value, lookbehind - 1)
             if share.hash in my_share_hashes)
-        actual_time = (tracker.shares[best_share_var.value].timestamp -
-            tracker.shares[tracker.get_nth_parent_hash(best_share_var.value, lookbehind - 1)].timestamp)
+        actual_time = (tracker.items[best_share_var.value].timestamp -
+            tracker.items[tracker.get_nth_parent_hash(best_share_var.value, lookbehind - 1)].timestamp)
         share_att_s = my_work / actual_time
         
         miner_hash_rates, miner_dead_hash_rates = get_local_rates()
@@ -176,29 +176,42 @@ def get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, 
             warnings=p2pool_data.get_warnings(tracker, best_share_var.value, net),
         )
     
-    class WebInterface(resource.Resource):
+    class WebInterface(deferred_resource.DeferredResource):
         def __init__(self, func, mime_type='application/json', args=()):
-            resource.Resource.__init__(self)
+            deferred_resource.DeferredResource.__init__(self)
             self.func, self.mime_type, self.args = func, mime_type, args
         
         def getChild(self, child, request):
             return WebInterface(self.func, self.mime_type, self.args + (child,))
         
+        @defer.inlineCallbacks
         def render_GET(self, request):
             request.setHeader('Content-Type', self.mime_type)
             request.setHeader('Access-Control-Allow-Origin', '*')
-            res = self.func(*self.args)
-            return json.dumps(res) if self.mime_type == 'application/json' else res
+            res = yield self.func(*self.args)
+            defer.returnValue(json.dumps(res) if self.mime_type == 'application/json' else res)
     
     web_root.putChild('rate', WebInterface(lambda: p2pool_data.get_pool_attempts_per_second(tracker, best_share_var.value, 720)/(1-p2pool_data.get_average_stale_prop(tracker, best_share_var.value, 720))))
-    web_root.putChild('difficulty', WebInterface(lambda: bitcoin_data.target_to_difficulty(tracker.shares[best_share_var.value].max_target)))
+    web_root.putChild('difficulty', WebInterface(lambda: bitcoin_data.target_to_difficulty(tracker.items[best_share_var.value].max_target)))
     web_root.putChild('users', WebInterface(get_users))
+    web_root.putChild('user_stales', WebInterface(lambda: dict((bitcoin_data.pubkey_hash_to_address(ph, net.PARENT), prop) for ph, prop in
+        p2pool_data.get_user_stale_props(tracker, best_share_var.value, tracker.get_height(best_share_var.value)).iteritems())))
     web_root.putChild('fee', WebInterface(lambda: worker_fee))
     web_root.putChild('current_payouts', WebInterface(lambda: dict((bitcoin_data.script2_to_address(script, net.PARENT), value/1e8) for script, value in get_current_txouts().iteritems())))
     web_root.putChild('patron_sendmany', WebInterface(get_patron_sendmany, 'text/plain'))
     web_root.putChild('global_stats', WebInterface(get_global_stats))
     web_root.putChild('local_stats', WebInterface(get_local_stats))
     web_root.putChild('peer_addresses', WebInterface(lambda: ['%s:%i' % (peer.transport.getPeer().host, peer.transport.getPeer().port) for peer in p2p_node.peers.itervalues()]))
+    web_root.putChild('pings', WebInterface(defer.inlineCallbacks(lambda: defer.returnValue(
+        dict([(a, (yield b)) for a, b in
+            [(
+                '%s:%i' % (peer.transport.getPeer().host, peer.transport.getPeer().port),
+                defer.inlineCallbacks(lambda peer=peer: defer.returnValue(
+                    min([(yield peer.do_ping().addCallback(lambda x: x/0.001).addErrback(lambda fail: None)) for i in xrange(3)])
+                ))()
+            ) for peer in list(p2p_node.peers.itervalues())]
+        ])
+    ))))
     web_root.putChild('peer_versions', WebInterface(lambda: dict(('%s:%i' % peer.addr, peer.other_sub_version) for peer in p2p_node.peers.itervalues())))
     web_root.putChild('payout_addr', WebInterface(lambda: bitcoin_data.pubkey_hash_to_address(my_pubkey_hash, net.PARENT)))
     web_root.putChild('recent_blocks', WebInterface(lambda: [dict(ts=s.timestamp, hash='%064x' % s.header_hash) for s in tracker.get_chain(best_share_var.value, 24*60*60//net.SHARE_PERIOD) if s.pow_hash <= s.header['bits'].target]))
@@ -241,7 +254,7 @@ def get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, 
                 incoming=sum(1 for peer in p2p_node.peers.itervalues() if peer.incoming),
                 outgoing=sum(1 for peer in p2p_node.peers.itervalues() if not peer.incoming),
             ),
-            attempts_to_share=bitcoin_data.target_to_average_attempts(tracker.shares[best_share_var.value].max_target),
+            attempts_to_share=bitcoin_data.target_to_average_attempts(tracker.items[best_share_var.value].max_target),
             attempts_to_block=bitcoin_data.target_to_average_attempts(bitcoind_work.value['bits'].target),
             block_value=bitcoind_work.value['subsidy']*1e-8,
         ))
@@ -252,15 +265,15 @@ def get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, 
     new_root.putChild('log', WebInterface(lambda: stat_log))
     
     def get_share(share_hash_str):
-        if int(share_hash_str, 16) not in tracker.shares:
+        if int(share_hash_str, 16) not in tracker.items:
             return None
-        share = tracker.shares[int(share_hash_str, 16)]
+        share = tracker.items[int(share_hash_str, 16)]
         
         return dict(
             parent='%064x' % share.previous_hash,
-            children=['%064x' % x for x in sorted(tracker.reverse_shares.get(share.hash, set()), key=lambda sh: -len(tracker.reverse_shares.get(sh, set())))], # sorted from most children to least children
+            children=['%064x' % x for x in sorted(tracker.reverse.get(share.hash, set()), key=lambda sh: -len(tracker.reverse.get(sh, set())))], # sorted from most children to least children
             local=dict(
-                verified=share.hash in tracker.verified.shares,
+                verified=share.hash in tracker.verified.items,
                 time_first_seen=start_time if share.time_seen == 0 else share.time_seen,
                 peer_first_received_from=share.peer.addr if share.peer is not None else None,
             ),
@@ -295,8 +308,8 @@ def get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, 
     new_root.putChild('share', WebInterface(lambda share_hash_str: get_share(share_hash_str)))
     new_root.putChild('heads', WebInterface(lambda: ['%064x' % x for x in tracker.heads]))
     new_root.putChild('verified_heads', WebInterface(lambda: ['%064x' % x for x in tracker.verified.heads]))
-    new_root.putChild('tails', WebInterface(lambda: ['%064x' % x for t in tracker.tails for x in tracker.reverse_shares.get(t, set())]))
-    new_root.putChild('verified_tails', WebInterface(lambda: ['%064x' % x for t in tracker.verified.tails for x in tracker.verified.reverse_shares.get(t, set())]))
+    new_root.putChild('tails', WebInterface(lambda: ['%064x' % x for t in tracker.tails for x in tracker.reverse.get(t, set())]))
+    new_root.putChild('verified_tails', WebInterface(lambda: ['%064x' % x for t in tracker.verified.tails for x in tracker.verified.reverse.get(t, set())]))
     new_root.putChild('best_share_hash', WebInterface(lambda: '%064x' % best_share_var.value))
     new_root.putChild('currency_info', WebInterface(lambda: dict(
         symbol=net.PARENT.SYMBOL,
