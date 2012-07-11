@@ -249,6 +249,10 @@ class WorkerBridge(worker_interface.WorkerBridge):
         
         def got_response(header, request):
             header_hash = bitcoin_data.hash256(bitcoin_data.block_header_type.pack(header))
+
+            if p2pool.DEBUG:
+                log.err('header hash: %064x' % header_hash)
+
             pow_hash = self.net.PARENT.POW_FUNC(bitcoin_data.block_header_type.pack(header))
             try:
                 if pow_hash <= header['bits'].target or p2pool.DEBUG:
