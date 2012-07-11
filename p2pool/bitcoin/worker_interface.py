@@ -10,6 +10,8 @@ from twisted.internet import defer
 import p2pool
 from p2pool.bitcoin import getwork
 from p2pool.util import expiring_dict, jsonrpc, variable
+from twisted.python import log
+from pprint import pformat
 
 class _Provider(object):
     def __init__(self, parent, long_poll):
@@ -57,11 +59,17 @@ class WorkerInterface(object):
     @defer.inlineCallbacks
     def _getwork(self, request, data, long_poll):
         request.setHeader('X-Long-Polling', '/long-polling')
-        request.setHeader('X-Roll-NTime', 'expire=10')
         request.setHeader('X-Is-P2Pool', 'true')
         
         if data is not None:
+            if p2pool.DEBUG:
+                log.err('Miner %s @ %s submitted work: %r' % (request.getUser(), request.getClientIP(), data))
+
             header = getwork.decode_data(data)
+
+            if p2pool.DEBUG:
+                log.err('Submitted header: %r' % header)
+
             if header['merkle_root'] not in self.merkle_roots:
                 print >>sys.stderr, '''Couldn't link returned work's merkle root with its handler. This should only happen if this process was recently restarted!'''
                 defer.returnValue(False)
@@ -69,6 +77,8 @@ class WorkerInterface(object):
             dt = header['timestamp'] - orig_timestamp
             if dt < 0 or dt % 12 == 11 or dt >= 600:
                 print >>sys.stderr, '''Miner %s @ %s rolled timestamp improperly! This may be a bug in the miner that is causing you to lose work!''' % (request.getUser(), request.getClientIP())
+                if p2pool.DEBUG:
+                    print 'timestamp %d=%d + %d' % (header['timestamp'], orig_timestamp, dt)
             defer.returnValue(handler(header, request))
         
         if p2pool.DEBUG:
@@ -100,6 +110,8 @@ class WorkerInterface(object):
             orig_timestamp = res.timestamp
         
         self.merkle_roots[res.merkle_root] = handler, orig_timestamp
+        if p2pool.DEBUG:
+            print 'Caching merkle root. handler %r orig timestamp %d' % (handler, orig_timestamp)
         
         if res.timestamp + 12 < orig_timestamp + 600:
             self.work_cache[key] = res.update(timestamp=res.timestamp + 12), orig_timestamp, handler
@@ -107,4 +119,9 @@ class WorkerInterface(object):
         if p2pool.DEBUG:
             print 'POLL %i END identifier=%i' % (id, self.worker_bridge.new_work_event.times)
         
-        defer.returnValue(res.getwork(identifier=str(self.worker_bridge.new_work_event.times), submitold=True))
+        work = res.getwork(identifier=str(self.worker_bridge.new_work_event.times), submitold=True)
+
+        if p2pool.DEBUG:
+            print 'Miner %s @ %s given new work:\n  key:%r\n  res:%s\n  work:%s' % (request.getUser(), request.getClientIP(), key, pformat(res), pformat(work))
+
+        defer.returnValue(work)
