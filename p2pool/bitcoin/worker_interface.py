@@ -56,8 +56,9 @@ class WorkerInterface(object):
     
     @defer.inlineCallbacks
     def _getwork(self, request, data, long_poll):
+        request.setHeader('X-Mining-Extensions', 'longpoll midstate rollntime submitold')
         request.setHeader('X-Long-Polling', '/long-polling')
-        request.setHeader('X-Roll-NTime', 'expire=10')
+        request.setHeader('X-Roll-NTime', 'expire=Y')
         request.setHeader('X-Is-P2Pool', 'true')
         
         if data is not None:
