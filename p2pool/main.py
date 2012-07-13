@@ -22,7 +22,7 @@ from nattraverso import portmapper, ipdiscover
 
 import bitcoin.p2p as bitcoin_p2p, bitcoin.data as bitcoin_data
 from bitcoin import worker_interface, height_tracker
-from util import expiring_dict, fixargparse, jsonrpc, variable, deferral, math, logging
+from util import expiring_dict, fixargparse, jsonrpc, variable, deferral, math, logging, sharelog
 from . import p2p, networks, web, work
 import p2pool, p2pool.data as p2pool_data
 
@@ -444,6 +444,12 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         worker_interface.WorkerInterface(wb).attach_to(web_root, get_handler=lambda request: request.redirect('/static/'))
         
         deferral.retry('Error binding to worker port:', traceback=False)(reactor.listenTCP)(worker_endpoint[1], server.Site(web_root), interface=worker_endpoint[0])
+
+        if args.sharelog is None:
+            sharelogfile = os.path.join(datadir_path, 'sharelog')
+        else:
+            sharelogfile = args.sharelog
+        sharelog.PseudoShareTracker().track(wb, logging.TimestampingPipe(logging.LogFile(sharelogfile)))
         
         with open(os.path.join(os.path.join(datadir_path, 'ready_flag')), 'wb') as f:
             pass
@@ -593,6 +599,9 @@ def run():
     parser.add_argument('--logfile',
         help='''log to this file (default: data/<NET>/log)''',
         type=str, action='store', default=None, dest='logfile')
+    parser.add_argument('--sharelog',
+        help='''log (pseudo)shares to this file (default: data/<NET>/sharelog)''',
+        type=str, action='store', default=None, dest='sharelog')
     parser.add_argument('--merged',
         help='call getauxblock on this url to get work for merged mining (example: http://ncuser:ncpass@127.0.0.1:10332/)',
         type=str, action='append', default=[], dest='merged_urls')
