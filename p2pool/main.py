@@ -445,7 +445,11 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         
         deferral.retry('Error binding to worker port:', traceback=False)(reactor.listenTCP)(worker_endpoint[1], server.Site(web_root), interface=worker_endpoint[0])
 
-        sharelog.PseudoShareTracker().track(wb, logging.TimestampingPipe(logging.LogFile(os.path.join(datadir_path, 'sharelog'))))
+        if args.sharelog is None:
+            sharelogfile = os.path.join(datadir_path, 'sharelog')
+        else:
+            sharelogfile = args.sharelog
+        sharelog.PseudoShareTracker().track(wb, logging.TimestampingPipe(logging.LogFile(sharelogfile)))
         
         with open(os.path.join(os.path.join(datadir_path, 'ready_flag')), 'wb') as f:
             pass
@@ -595,6 +599,9 @@ def run():
     parser.add_argument('--logfile',
         help='''log to this file (default: data/<NET>/log)''',
         type=str, action='store', default=None, dest='logfile')
+    parser.add_argument('--sharelog',
+        help='''log (pseudo)shares to this file (default: data/<NET>/sharelog)''',
+        type=str, action='store', default=None, dest='sharelog')
     parser.add_argument('--merged',
         help='call getauxblock on this url to get work for merged mining (example: http://ncuser:ncpass@127.0.0.1:10332/)',
         type=str, action='append', default=[], dest='merged_urls')
