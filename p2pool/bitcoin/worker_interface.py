@@ -65,10 +65,7 @@ class WorkerInterface(object):
             if header['merkle_root'] not in self.merkle_roots:
                 print >>sys.stderr, '''Couldn't link returned work's merkle root with its handler. This should only happen if this process was recently restarted!'''
                 defer.returnValue(False)
-            handler, orig_timestamp = self.merkle_roots[header['merkle_root']]
-            dt = header['timestamp'] - orig_timestamp
-            if dt < 0 or dt % 12 == 11 or dt >= 600:
-                print >>sys.stderr, '''Miner %s @ %s rolled timestamp improperly! This may be a bug in the miner that is causing you to lose work!''' % (request.getUser(), request.getClientIP())
+            handler = self.merkle_roots[header['merkle_root']]
             defer.returnValue(handler(header, request))
         
         if p2pool.DEBUG:
@@ -93,16 +90,13 @@ class WorkerInterface(object):
             self.work_cache_times = self.worker_bridge.new_work_event.times
         
         if key in self.work_cache:
-            res, orig_timestamp, handler = self.work_cache.pop(key)
+            res, handler = self.work_cache[key]
         else:
             res, handler = self.worker_bridge.get_work(*key)
             assert res.merkle_root not in self.merkle_roots
-            orig_timestamp = res.timestamp
+            self.work_cache[key] = res, handler
         
-        self.merkle_roots[res.merkle_root] = handler, orig_timestamp
-        
-        if res.timestamp + 12 < orig_timestamp + 600:
-            self.work_cache[key] = res.update(timestamp=res.timestamp + 12), orig_timestamp, handler
+        self.merkle_roots[res.merkle_root] = handler
         
         if p2pool.DEBUG:
             print 'POLL %i END identifier=%i' % (id, self.worker_bridge.new_work_event.times)
