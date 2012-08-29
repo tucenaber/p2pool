@@ -232,11 +232,17 @@ class Share(object):
     def __repr__(self):
         return '<Share %s>' % (' '.join('%s=%r' % (k, getattr(self, k)) for k in self.__slots__),)
     
+    def as_share1a(self):
+        return dict(type=4, contents=self.share1a_type.pack(dict(common=self.common, merkle_link=self.merkle_link)))
+    
+    def as_share1b(self):
+        return dict(type=5, contents=self.share1b_type.pack(dict(common=self.common, other_txs=self.other_txs)))
+    
     def as_share(self):
         if not self.pow_hash <= self.header['bits'].target: # share1a
-            return dict(type=4, contents=self.share1a_type.pack(dict(common=self.common, merkle_link=self.merkle_link)))
-        else: # share1b
-            return dict(type=5, contents=self.share1b_type.pack(dict(common=self.common, other_txs=self.other_txs)))
+            return self.as_share1a()
+        else:
+            return self.as_share1b()
     
     def check(self, tracker):
         share_info, gentx = self.generate_transaction(tracker, self.share_info['share_data'], self.header['bits'].target, self.share_info['timestamp'], self.share_info['bits'].target, self.common['ref_merkle_link'], self.net)
@@ -526,16 +532,22 @@ def get_desired_version_counts(tracker, best_share_hash, dist):
         res[share.desired_version] = res.get(share.desired_version, 0) + bitcoin_data.target_to_average_attempts(share.target)
     return res
 
-def get_warnings(tracker, best_share, net):
+def get_warnings(tracker, best_share, net, bitcoind_warning, bitcoind_work_value):
     res = []
     
     desired_version_counts = get_desired_version_counts(tracker, best_share,
         min(60*60//net.SHARE_PERIOD, tracker.get_height(best_share)))
     majority_desired_version = max(desired_version_counts, key=lambda k: desired_version_counts[k])
-    if majority_desired_version not in [0, 1, 2, 3] and desired_version_counts[majority_desired_version] > sum(desired_version_counts.itervalues())/2:
+    if majority_desired_version not in [0, 1, 2, 3, 4] and desired_version_counts[majority_desired_version] > sum(desired_version_counts.itervalues())/2:
         res.append('A MAJORITY OF SHARES CONTAIN A VOTE FOR AN UNSUPPORTED SHARE IMPLEMENTATION! (v%i with %i%% support)\n'
             'An upgrade is likely necessary. Check http://p2pool.forre.st/ for more information.' % (
                 majority_desired_version, 100*desired_version_counts[majority_desired_version]/sum(desired_version_counts.itervalues())))
+    
+    if bitcoind_warning is not None:
+        res.append('(from bitcoind) %s' % (bitcoind_warning,))
+    
+    if time.time() > bitcoind_work_value['last_update'] + 60:
+        res.append('''LOST CONTACT WITH BITCOIND for %s! Check that it isn't frozen or dead!''' % (math.format_dt(time.time() - bitcoind_work_value['last_update']),))
     
     return res
 

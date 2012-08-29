@@ -43,7 +43,7 @@ class WorkerInterface(object):
         self.work_cache = {}
         self.work_cache_times = self.worker_bridge.new_work_event.times
         
-        self.merkle_roots = expiring_dict.ExpiringDict(300)
+        self.merkle_root_to_handler = expiring_dict.ExpiringDict(300)
     
     def attach_to(self, res, get_handler=None):
         res.putChild('', _GETableServer(_Provider(self, long_poll=False), get_handler))
@@ -63,11 +63,10 @@ class WorkerInterface(object):
         
         if data is not None:
             header = getwork.decode_data(data)
-            if header['merkle_root'] not in self.merkle_roots:
+            if header['merkle_root'] not in self.merkle_root_to_handler:
                 print >>sys.stderr, '''Couldn't link returned work's merkle root with its handler. This should only happen if this process was recently restarted!'''
                 defer.returnValue(False)
-            handler = self.merkle_roots[header['merkle_root']]
-            defer.returnValue(handler(header, request))
+            defer.returnValue(self.merkle_root_to_handler[header['merkle_root']](header, request))
         
         if p2pool.DEBUG:
             id = random.randrange(1000, 10000)
@@ -94,10 +93,10 @@ class WorkerInterface(object):
             res, handler = self.work_cache[key]
         else:
             res, handler = self.worker_bridge.get_work(*key)
-            assert res.merkle_root not in self.merkle_roots
+            assert res.merkle_root not in self.merkle_root_to_handler
             self.work_cache[key] = res, handler
         
-        self.merkle_roots[res.merkle_root] = handler
+        self.merkle_root_to_handler[res.merkle_root] = handler
         
         if p2pool.DEBUG:
             print 'POLL %i END identifier=%i' % (id, self.worker_bridge.new_work_event.times)
