@@ -9,7 +9,7 @@ from twisted.internet import defer
 from twisted.python import log
 
 import bitcoin.getwork as bitcoin_getwork, bitcoin.data as bitcoin_data
-from bitcoin import worker_interface
+from bitcoin import script, worker_interface
 from util import jsonrpc, variable, deferral, math, pack
 import p2pool, p2pool.data as p2pool_data
 
@@ -65,7 +65,7 @@ class WorkerBridge(worker_interface.WorkerBridge):
                 auxblock = yield deferral.retry('Error while calling merged getauxblock:', 30)(merged_proxy.rpc_getauxblock)()
                 self.merged_work.set(dict(self.merged_work.value, **{auxblock['chainid']: dict(
                     hash=int(auxblock['hash'], 16),
-                    target=pack.IntType(256).unpack(auxblock['target'].decode('hex')),
+                    target='p2pool' if auxblock['target'] == 'p2pool' else pack.IntType(256).unpack(auxblock['target'].decode('hex')),
                     merged_proxy=merged_proxy,
                 )}))
                 yield deferral.sleep(1)
@@ -80,8 +80,7 @@ class WorkerBridge(worker_interface.WorkerBridge):
         
         self.current_work = variable.Variable(None)
         def compute_work():
-            t = dict(self.bitcoind_work.value)
-            
+            t = self.bitcoind_work.value
             bb = self.best_block_header.value
             if bb is not None and bb['previous_block'] == t['previous_block'] and net.PARENT.POW_FUNC(bitcoin_data.block_header_type.pack(bb)) <= t['bits'].target:
                 print 'Skipping from block %x to block %x!' % (bb['previous_block'],
@@ -91,11 +90,11 @@ class WorkerBridge(worker_interface.WorkerBridge):
                     previous_block=bitcoin_data.hash256(bitcoin_data.block_header_type.pack(bb)),
                     bits=bb['bits'], # not always true
                     coinbaseflags='',
+                    height=t['height'] + 1,
                     time=bb['timestamp'] + 600, # better way?
                     transactions=[],
                     merkle_link=bitcoin_data.calculate_merkle_link([None], 0),
                     subsidy=net.PARENT.SUBSIDY_FUNC(self.block_height_var.value),
-                    clock_offset=self.bitcoind_work.value['clock_offset'],
                     last_update=self.bitcoind_work.value['last_update'],
                 )
             
@@ -163,11 +162,11 @@ class WorkerBridge(worker_interface.WorkerBridge):
     
     def get_work(self, pubkey_hash, desired_share_target, desired_pseudoshare_target):
         if len(self.p2p_node.peers) == 0 and self.net.PERSIST:
-            raise jsonrpc.Error(-12345, u'p2pool is not connected to any peers')
+            raise jsonrpc.Error_for_code(-12345)(u'p2pool is not connected to any peers')
         if self.best_share_var.value is None and self.net.PERSIST:
-            raise jsonrpc.Error(-12345, u'p2pool is downloading shares')
+            raise jsonrpc.Error_for_code(-12345)(u'p2pool is downloading shares')
         if time.time() > self.current_work.value['last_update'] + 60:
-            raise jsonrpc.Error(-12345, u'lost contact with bitcoind')
+            raise jsonrpc.Error_for_code(-12345)(u'lost contact with bitcoind')
         
         if self.merged_work.value:
             tree, size = bitcoin_data.make_auxpow_tree(self.merged_work.value)
@@ -187,7 +186,10 @@ class WorkerBridge(worker_interface.WorkerBridge):
                 tracker=self.tracker,
                 share_data=dict(
                     previous_share_hash=self.best_share_var.value,
-                    coinbase=(mm_data + self.current_work.value['coinbaseflags'])[:100],
+                    coinbase=(script.create_push_script([
+                        self.current_work.value['height'],
+                        ] + ([mm_data] if mm_data else []) + [
+                    ]) + self.current_work.value['coinbaseflags'])[:100],
                     nonce=random.randrange(2**32),
                     pubkey_hash=pubkey_hash,
                     subsidy=self.current_work.value['subsidy'],
@@ -197,14 +199,16 @@ class WorkerBridge(worker_interface.WorkerBridge):
                         'doa' if doas > doas_recorded_in_chain else
                         None
                     )(*self.get_stale_counts()),
-                    desired_version=3,
+                    desired_version=4,
                 ),
                 block_target=self.current_work.value['bits'].target,
-                desired_timestamp=int(time.time() - self.current_work.value['clock_offset']),
+                desired_timestamp=int(time.time() + 0.5),
                 desired_target=desired_share_target,
                 ref_merkle_link=dict(branch=[], index=0),
                 net=self.net,
             )
+        
+        mm_later = [(dict(aux_work, target=aux_work['target'] if aux_work['target'] != 'p2pool' else share_info['bits'].target), index, hashes) for aux_work, index, hashes in mm_later]
         
         if desired_pseudoshare_target is None:
             target = 2**256-1
@@ -215,7 +219,7 @@ class WorkerBridge(worker_interface.WorkerBridge):
         else:
             target = desired_pseudoshare_target
         target = max(target, share_info['bits'].target)
-        for aux_work in self.merged_work.value.itervalues():
+        for aux_work, index, hashes in mm_later:
             target = max(target, aux_work['target'])
         target = math.clip(target, self.net.PARENT.SANE_TARGET_RANGE)
         
@@ -237,7 +241,7 @@ class WorkerBridge(worker_interface.WorkerBridge):
         bits = self.current_work.value['bits']
         previous_block = self.current_work.value['previous_block']
         ba = bitcoin_getwork.BlockAttempt(
-            version=self.current_work.value['version'],
+            version=min(self.current_work.value['version'], 2),
             previous_block=self.current_work.value['previous_block'],
             merkle_root=merkle_root,
             timestamp=self.current_work.value['time'],
@@ -289,7 +293,7 @@ class WorkerBridge(worker_interface.WorkerBridge):
                             )).encode('hex'),
                         )
                         @df.addCallback
-                        def _(result):
+                        def _(result, aux_work=aux_work):
                             if result != (pow_hash <= aux_work['target']):
                                 print >>sys.stderr, 'Merged block submittal result: %s Expected: %s' % (result, pow_hash <= aux_work['target'])
                             else:
