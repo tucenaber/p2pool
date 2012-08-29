@@ -56,8 +56,9 @@ class WorkerInterface(object):
     
     @defer.inlineCallbacks
     def _getwork(self, request, data, long_poll):
+        request.setHeader('X-Mining-Extensions', 'longpoll midstate rollntime submitold')
         request.setHeader('X-Long-Polling', '/long-polling')
-        request.setHeader('X-Roll-NTime', 'expire=10')
+        request.setHeader('X-Roll-NTime', 'expire=Y')
         request.setHeader('X-Is-P2Pool', 'true')
         
         if data is not None:
@@ -89,16 +90,13 @@ class WorkerInterface(object):
             self.work_cache_times = self.worker_bridge.new_work_event.times
         
         if key in self.work_cache:
-            res, orig_timestamp, handler = self.work_cache.pop(key)
+            res, handler = self.work_cache[key]
         else:
             res, handler = self.worker_bridge.get_work(*key)
             assert res.merkle_root not in self.merkle_root_to_handler
             orig_timestamp = res.timestamp
         
         self.merkle_root_to_handler[res.merkle_root] = handler
-        
-        if res.timestamp + 120 < orig_timestamp + 1800:
-            self.work_cache[key] = res.update(timestamp=res.timestamp + 120), orig_timestamp, handler
         
         if p2pool.DEBUG:
             print 'POLL %i END identifier=%i' % (id, self.worker_bridge.new_work_event.times)
