@@ -10,6 +10,8 @@ from twisted.internet import defer
 import p2pool
 from p2pool.bitcoin import getwork
 from p2pool.util import expiring_dict, jsonrpc, variable
+from twisted.python import log
+from pprint import pformat
 
 class _Provider(object):
     def __init__(self, parent, long_poll):
@@ -62,6 +64,9 @@ class WorkerInterface(object):
         request.setHeader('X-Is-P2Pool', 'true')
         
         if data is not None:
+            if p2pool.DEBUG:
+                log.err('Miner %s @ %s submitted work: %r' % (request.getUser(), request.getClientIP(), data))
+
             header = getwork.decode_data(data)
             if header['merkle_root'] not in self.merkle_root_to_handler:
                 print >>sys.stderr, '''Couldn't link returned work's merkle root with its handler. This should only happen if this process was recently restarted!'''
@@ -101,4 +106,9 @@ class WorkerInterface(object):
         if p2pool.DEBUG:
             print 'POLL %i END identifier=%i' % (id, self.worker_bridge.new_work_event.times)
         
-        defer.returnValue(res.getwork(identifier=str(self.worker_bridge.new_work_event.times), submitold=True))
+        work = res.getwork(identifier=str(self.worker_bridge.new_work_event.times), submitold=True)
+
+        if p2pool.DEBUG:
+            print 'Miner %s @ %s given new work:\n  key:%r\n  res:%s\n  work:%s' % (request.getUser(), request.getClientIP(), key, pformat(res), pformat(work))
+
+        defer.returnValue(work)
