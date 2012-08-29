@@ -99,7 +99,7 @@ class WorkerInterface(object):
         else:
             res, handler = self.worker_bridge.get_work(*key)
             assert res.merkle_root not in self.merkle_root_to_handler
-            orig_timestamp = res.timestamp
+            self.work_cache[key] = res, handler
         
         self.merkle_root_to_handler[res.merkle_root] = handler
         
