@@ -68,6 +68,8 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         print 'p2pool (version %s)' % (p2pool.__version__,)
         print
         
+        traffic_happened = variable.Event()
+        
         # connect to bitcoind over JSON-RPC and do initial getmemorypool
         url = 'http://%s:%i/' % (args.bitcoind_address, args.bitcoind_rpc_port)
         print '''Testing bitcoind RPC connection to '%s' with username '%s'...''' % (url, args.bitcoind_rpc_username)
@@ -78,12 +80,11 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
             if not (yield net.PARENT.RPC_CHECK(bitcoind)):
                 print >>sys.stderr, "    Check failed! Make sure that you're connected to the right bitcoind with --bitcoind-rpc-port!"
                 raise deferral.RetrySilentlyException()
-            temp_work = yield getwork(bitcoind)
-            if not net.VERSION_CHECK((yield bitcoind.rpc_getinfo())['version'], temp_work):
-                print >>sys.stderr, '    Bitcoin version too old! BIP16 support required! Upgrade to 0.6.0rc4 or greater!'
+            if not net.VERSION_CHECK((yield bitcoind.rpc_getinfo())['version']):
+                print >>sys.stderr, '    Bitcoin version too old! Upgrade to 0.6.4 or newer!'
                 raise deferral.RetrySilentlyException()
-            defer.returnValue(temp_work)
-        temp_work = yield check()
+        yield check()
+        temp_work = yield getwork(bitcoind)
         
         block_height_var = variable.Variable(None)
         @defer.inlineCallbacks
@@ -369,6 +370,7 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
             addr_store=addrs,
             connect_addrs=connect_addrs,
             max_incoming_conns=args.p2pool_conns,
+            traffic_happened=traffic_happened,
         )
         p2p_node.start()
         
@@ -425,8 +427,12 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                     )
                 except:
                     log.err(None, 'in download_shares:')
-                else:
-                    p2p_node.handle_shares(shares, peer)
+                    continue
+                
+                if not shares:
+                    yield deferral.sleep(1) # sleep so we don't keep rerequesting the same share nobody has
+                    continue
+                p2p_node.handle_shares(shares, peer)
         
         print '    ...success!'
         print
@@ -455,7 +461,7 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         get_current_txouts = lambda: p2pool_data.get_expected_payouts(tracker, best_share_var.value, bitcoind_work.value['bits'].target, bitcoind_work.value['subsidy'], net)
         
         wb = work.WorkerBridge(my_pubkey_hash, net, args.donation_percentage, bitcoind_work, best_block_header, merged_urls, best_share_var, tracker, my_share_hashes, my_doa_share_hashes, args.worker_fee, p2p_node, submit_block, set_best_share, broadcast_share, block_height_var)
-        web_root = web.get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, wb.get_stale_counts, my_pubkey_hash, wb.local_rate_monitor, args.worker_fee, p2p_node, wb.my_share_hashes, wb.pseudoshare_received, wb.share_received, best_share_var, bitcoind_warning_var)
+        web_root = web.get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, wb.get_stale_counts, my_pubkey_hash, wb.local_rate_monitor, args.worker_fee, p2p_node, wb.my_share_hashes, wb.pseudoshare_received, wb.share_received, best_share_var, bitcoind_warning_var, traffic_happened)
         worker_interface.WorkerInterface(wb).attach_to(web_root, get_handler=lambda request: request.redirect('/static/'))
         
         deferral.retry('Error binding to worker port:', traceback=False)(reactor.listenTCP)(worker_endpoint[1], server.Site(web_root), interface=worker_endpoint[0])
