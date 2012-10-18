@@ -1,7 +1,5 @@
 from __future__ import division
 
-import ConfigParser
-import StringIO
 import base64
 import json
 import os
@@ -52,7 +50,7 @@ def getwork(bitcoind, use_getblocktemplate=False):
         version=work['version'],
         previous_block=int(work['previousblockhash'], 16),
         transactions=map(bitcoin_data.tx_type.unpack, packed_transactions),
-        merkle_link=bitcoin_data.calculate_merkle_link([None] + map(bitcoin_data.hash256, packed_transactions), 0),
+        transaction_hashes=map(bitcoin_data.hash256, packed_transactions),
         subsidy=work['coinbasevalue'],
         time=work['time'] if 'time' in work else work['curtime'],
         bits=bitcoin_data.FloatingIntegerType().unpack(work['bits'].decode('hex')[::-1]) if isinstance(work['bits'], (str, unicode)) else bitcoin_data.FloatingInteger(work['bits']),
@@ -70,8 +68,22 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         
         traffic_happened = variable.Event()
         
+        @defer.inlineCallbacks
+        def connect_p2p():
+            # connect to bitcoind over bitcoin-p2p
+            print '''Testing bitcoind P2P connection to '%s:%s'...''' % (args.bitcoind_address, args.bitcoind_p2p_port)
+            factory = bitcoin_p2p.ClientFactory(net.PARENT)
+            reactor.connectTCP(args.bitcoind_address, args.bitcoind_p2p_port, factory)
+            yield factory.getProtocol() # waits until handshake is successful
+            print '    ...success!'
+            print
+            defer.returnValue(factory)
+        
+        if args.testnet: # establish p2p connection first if testnet so bitcoind can work without connections
+            factory = yield connect_p2p()
+        
         # connect to bitcoind over JSON-RPC and do initial getmemorypool
-        url = 'http://%s:%i/' % (args.bitcoind_address, args.bitcoind_rpc_port)
+        url = '%s://%s:%i/' % ('https' if args.bitcoind_rpc_ssl else 'http', args.bitcoind_address, args.bitcoind_rpc_port)
         print '''Testing bitcoind RPC connection to '%s' with username '%s'...''' % (url, args.bitcoind_rpc_username)
         bitcoind = jsonrpc.Proxy(url, dict(Authorization='Basic ' + base64.b64encode(args.bitcoind_rpc_username + ':' + args.bitcoind_rpc_password)), timeout=30)
         @deferral.retry('Error while checking Bitcoin connection:', 1)
@@ -85,6 +97,9 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                 raise deferral.RetrySilentlyException()
         yield check()
         temp_work = yield getwork(bitcoind)
+        
+        if not args.testnet:
+            factory = yield connect_p2p()
         
         block_height_var = variable.Variable(None)
         @defer.inlineCallbacks
@@ -104,14 +119,6 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         print '    ...success!'
         print '    Current block hash: %x' % (temp_work['previous_block'],)
         print '    Current block height: %i' % (block_height_var.value,)
-        print
-        
-        # connect to bitcoind over bitcoin-p2p
-        print '''Testing bitcoind P2P connection to '%s:%s'...''' % (args.bitcoind_address, args.bitcoind_p2p_port)
-        factory = bitcoin_p2p.ClientFactory(net.PARENT)
-        reactor.connectTCP(args.bitcoind_address, args.bitcoind_p2p_port, factory)
-        yield factory.getProtocol() # waits until handshake is successful
-        print '    ...success!'
         print
         
         print 'Determining payout address...'
@@ -220,12 +227,14 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         
         # BEST SHARE
         
+        known_txs_var = variable.Variable({}) # hash -> tx
+        mining_txs_var = variable.Variable({}) # hash -> tx
         get_height_rel_highest = yield height_tracker.get_height_rel_highest_func(bitcoind, factory, lambda: bitcoind_work.value['previous_block'], net)
         
         best_share_var = variable.Variable(None)
         desired_var = variable.Variable(None)
         def set_best_share():
-            best, desired = tracker.think(get_height_rel_highest, bitcoind_work.value['previous_block'], bitcoind_work.value['bits'])
+            best, desired = tracker.think(get_height_rel_highest, bitcoind_work.value['previous_block'], bitcoind_work.value['bits'], known_txs_var.value)
             
             best_share_var.set(best)
             desired_var.set(desired)
@@ -236,6 +245,30 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         print
         
         # setup p2p logic and join p2pool network
+        
+        # update mining_txs according to getwork results
+        @bitcoind_work.changed.run_and_watch
+        def _(_=None):
+            new_mining_txs = {}
+            new_known_txs = dict(known_txs_var.value)
+            for tx_hash, tx in zip(bitcoind_work.value['transaction_hashes'], bitcoind_work.value['transactions']):
+                new_mining_txs[tx_hash] = tx
+                new_known_txs[tx_hash] = tx
+            mining_txs_var.set(new_mining_txs)
+            known_txs_var.set(new_known_txs)
+        # add p2p transactions from bitcoind to known_txs
+        @factory.new_tx.watch
+        def _(tx):
+            new_known_txs = dict(known_txs_var.value)
+            new_known_txs[bitcoin_data.hash256(bitcoin_data.tx_type.pack(tx))] = tx
+            known_txs_var.set(new_known_txs)
+        # forward transactions seen to bitcoind
+        @known_txs_var.transitioned.watch
+        @defer.inlineCallbacks
+        def _(before, after):
+            yield deferral.sleep(random.expovariate(1/1))
+            for tx_hash in set(after) - set(before):
+                factory.conn.value.send_tx(tx=after[tx_hash])
         
         class Node(p2p.Node):
             def handle_shares(self, shares, peer):
@@ -320,7 +353,11 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         @tracker.verified.added.watch
         def _(share):
             if share.pow_hash <= share.header['bits'].target:
-                submit_block(share.as_block(tracker), ignore_failure=True)
+                block = share.as_block(tracker, known_txs_var.value)
+                if block is None:
+                    print >>sys.stderr, 'GOT INCOMPLETE BLOCK FROM PEER! %s bitcoin: %s%064x' % (p2pool_data.format_hash(share.hash), net.PARENT.BLOCK_EXPLORER_URL_PREFIX, share.header_hash)
+                    return
+                submit_block(block, ignore_failure=True)
                 print
                 print 'GOT BLOCK FROM PEER! Passing to bitcoind! %s bitcoin: %s%064x' % (p2pool_data.format_hash(share.hash), net.PARENT.BLOCK_EXPLORER_URL_PREFIX, share.header_hash)
                 print
@@ -371,8 +408,22 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
             connect_addrs=connect_addrs,
             max_incoming_conns=args.p2pool_conns,
             traffic_happened=traffic_happened,
+            known_txs_var=known_txs_var,
+            mining_txs_var=mining_txs_var,
         )
         p2p_node.start()
+        
+        def forget_old_txs():
+            new_known_txs = {}
+            for peer in p2p_node.peers.itervalues():
+                new_known_txs.update(peer.remembered_txs)
+            new_known_txs.update(mining_txs_var.value)
+            for share in tracker.get_chain(best_share_var.value, min(120, tracker.get_height(best_share_var.value))):
+                for tx_hash in share.new_transaction_hashes:
+                    if tx_hash in known_txs_var.value:
+                        new_known_txs[tx_hash] = known_txs_var.value[tx_hash]
+            known_txs_var.set(new_known_txs)
+        task.LoopingCall(forget_old_txs).start(10)
         
         def save_addrs():
             with open(os.path.join(datadir_path, 'addrs'), 'wb') as f:
@@ -394,7 +445,7 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                 shares.append(share)
             
             for peer in list(p2p_node.peers.itervalues()):
-                yield peer.sendShares([share for share in shares if share.peer is not peer])
+                yield peer.sendShares([share for share in shares if share.peer is not peer], tracker, known_txs_var.value, include_txs_with=[share_hash])
         
         # send share when the chain changes to their chain
         best_share_var.changed.watch(broadcast_share)
@@ -461,7 +512,7 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         get_current_txouts = lambda: p2pool_data.get_expected_payouts(tracker, best_share_var.value, bitcoind_work.value['bits'].target, bitcoind_work.value['subsidy'], net)
         
         wb = work.WorkerBridge(my_pubkey_hash, net, args.donation_percentage, bitcoind_work, best_block_header, merged_urls, best_share_var, tracker, my_share_hashes, my_doa_share_hashes, args.worker_fee, p2p_node, submit_block, set_best_share, broadcast_share, block_height_var)
-        web_root = web.get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, wb.get_stale_counts, my_pubkey_hash, wb.local_rate_monitor, args.worker_fee, p2p_node, wb.my_share_hashes, wb.pseudoshare_received, wb.share_received, best_share_var, bitcoind_warning_var, traffic_happened)
+        web_root = web.get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, wb.get_stale_counts, my_pubkey_hash, wb.local_rate_monitor, args.worker_fee, p2p_node, wb.my_share_hashes, wb.pseudoshare_received, wb.share_received, best_share_var, bitcoind_warning_var, traffic_happened, args.donation_percentage)
         worker_interface.WorkerInterface(wb).attach_to(web_root, get_handler=lambda request: request.redirect('/static/'))
         
         deferral.retry('Error binding to worker port:', traceback=False)(reactor.listenTCP)(worker_endpoint[1], server.Site(web_root), interface=worker_endpoint[0])
@@ -509,11 +560,14 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                         print repr(line)
                     irc.IRCClient.lineReceived(self, line)
                 def signedOn(self):
+                    self.in_channel = False
                     irc.IRCClient.signedOn(self)
                     self.factory.resetDelay()
                     self.join(self.channel)
                     @defer.inlineCallbacks
                     def new_share(share):
+                        if not self.in_channel:
+                            return
                         if share.pow_hash <= share.header['bits'].target and abs(share.timestamp - time.time()) < 10*60:
                             yield deferral.sleep(random.expovariate(1/60))
                             message = '\x02%s BLOCK FOUND by %s! %s%064x' % (net.NAME.upper(), bitcoin_data.script2_to_address(share.new_script, net.PARENT), net.PARENT.BLOCK_EXPLORER_URL_PREFIX, share.header_hash)
@@ -522,6 +576,10 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                                 self._remember_message(message)
                     self.watch_id = tracker.verified.added.watch(new_share)
                     self.recent_messages = []
+                def joined(self, channel):
+                    self.in_channel = True
+                def left(self, channel):
+                    self.in_channel = False
                 def _remember_message(self, message):
                     self.recent_messages.append(message)
                     while len(self.recent_messages) > 100:
@@ -665,6 +723,9 @@ def run():
     bitcoind_group.add_argument('--bitcoind-rpc-port', metavar='BITCOIND_RPC_PORT',
         help='''connect to JSON-RPC interface at this port (default: %s <read from bitcoin.conf if password not provided>)''' % ', '.join('%s:%i' % (name, net.PARENT.RPC_PORT) for name, net in sorted(realnets.items())),
         type=int, action='store', default=None, dest='bitcoind_rpc_port')
+    bitcoind_group.add_argument('--bitcoind-rpc-ssl',
+        help='connect to JSON-RPC interface using SSL',
+        action='store_true', default=False, dest='bitcoind_rpc_ssl')
     bitcoind_group.add_argument('--bitcoind-p2p-port', metavar='BITCOIND_P2P_PORT',
         help='''connect to P2P interface at this port (default: %s <read from bitcoin.conf if password not provided>)''' % ', '.join('%s:%i' % (name, net.PARENT.P2P_PORT) for name, net in sorted(realnets.items())),
         type=int, action='store', default=None, dest='bitcoind_p2p_port')
@@ -700,17 +761,23 @@ def run():
                 '''rpcpassword=%x\r\n'''
                 '''\r\n'''
                 '''Keep that password secret! After creating the file, restart Bitcoin.''' % (conf_path, random.randrange(2**128)))
-        with open(conf_path, 'rb') as f:
-            cp = ConfigParser.RawConfigParser()
-            cp.readfp(StringIO.StringIO('[x]\r\n' + f.read()))
-            for conf_name, var_name, var_type in [
-                ('rpcuser', 'bitcoind_rpc_username', str),
-                ('rpcpassword', 'bitcoind_rpc_password', str),
-                ('rpcport', 'bitcoind_rpc_port', int),
-                ('port', 'bitcoind_p2p_port', int),
-            ]:
-                if getattr(args, var_name) is None and cp.has_option('x', conf_name):
-                    setattr(args, var_name, var_type(cp.get('x', conf_name)))
+        conf = open(conf_path, 'rb').read()
+        contents = {}
+        for line in conf.splitlines(True):
+            if '#' in line:
+                line = line[:line.index('#')]
+            if '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            contents[k.strip()] = v.strip()
+        for conf_name, var_name, var_type in [
+            ('rpcuser', 'bitcoind_rpc_username', str),
+            ('rpcpassword', 'bitcoind_rpc_password', str),
+            ('rpcport', 'bitcoind_rpc_port', int),
+            ('port', 'bitcoind_p2p_port', int),
+        ]:
+            if getattr(args, var_name) is None and conf_name in contents:
+                setattr(args, var_name, var_type(contents[conf_name]))
         if args.bitcoind_rpc_password is None:
             parser.error('''Bitcoin configuration file didn't contain an rpcpassword= line! Add one!''')
     

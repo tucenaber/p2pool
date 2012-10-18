@@ -13,7 +13,7 @@ from twisted.web import resource, static
 import p2pool
 from bitcoin import data as bitcoin_data
 from . import data as p2pool_data
-from util import deferred_resource, graph, math
+from util import deferred_resource, graph, math, pack
 
 def _atomic_read(filename):
     try:
@@ -44,7 +44,7 @@ def _atomic_write(filename, data):
         os.remove(filename)
         os.rename(filename + '.new', filename)
 
-def get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, get_stale_counts, my_pubkey_hash, local_rate_monitor, worker_fee, p2p_node, my_share_hashes, pseudoshare_received, share_received, best_share_var, bitcoin_warning_var, traffic_happened):
+def get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, get_stale_counts, my_pubkey_hash, local_rate_monitor, worker_fee, p2p_node, my_share_hashes, pseudoshare_received, share_received, best_share_var, bitcoin_warning_var, traffic_happened, donation_percentage):
     start_time = time.time()
     
     web_root = resource.Resource()
@@ -101,9 +101,9 @@ def get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, 
     
     def get_global_stats():
         # averaged over last hour
-        lookbehind = 3600//net.SHARE_PERIOD
-        if tracker.get_height(best_share_var.value) < lookbehind:
+        if tracker.get_height(best_share_var.value) < 10:
             return None
+        lookbehind = min(tracker.get_height(best_share_var.value), 3600//net.SHARE_PERIOD)
         
         nonstale_hash_rate = p2pool_data.get_pool_attempts_per_second(tracker, best_share_var.value, lookbehind)
         stale_prop = p2pool_data.get_average_stale_prop(tracker, best_share_var.value, lookbehind)
@@ -115,9 +115,9 @@ def get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, 
         )
     
     def get_local_stats():
-        lookbehind = 3600//net.SHARE_PERIOD
-        if tracker.get_height(best_share_var.value) < lookbehind:
+        if tracker.get_height(best_share_var.value) < 10:
             return None
+        lookbehind = min(tracker.get_height(best_share_var.value), 3600//net.SHARE_PERIOD)
         
         global_stale_prop = p2pool_data.get_average_stale_prop(tracker, best_share_var.value, lookbehind)
         
@@ -172,8 +172,11 @@ def get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, 
                 dead=stale_doa_shares,
             ),
             uptime=time.time() - start_time,
+            attempts_to_share=bitcoin_data.target_to_average_attempts(tracker.items[best_share_var.value].max_target),
+            attempts_to_block=bitcoin_data.target_to_average_attempts(bitcoind_work.value['bits'].target),
             block_value=bitcoind_work.value['subsidy']*1e-8,
             warnings=p2pool_data.get_warnings(tracker, best_share_var.value, net, bitcoin_warning_var.value, bitcoind_work.value),
+            donation_proportion=donation_percentage/100,
         )
     
     class WebInterface(deferred_resource.DeferredResource):
@@ -202,6 +205,7 @@ def get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, 
     web_root.putChild('global_stats', WebInterface(get_global_stats))
     web_root.putChild('local_stats', WebInterface(get_local_stats))
     web_root.putChild('peer_addresses', WebInterface(lambda: ['%s:%i' % (peer.transport.getPeer().host, peer.transport.getPeer().port) for peer in p2p_node.peers.itervalues()]))
+    web_root.putChild('peer_txpool_sizes', WebInterface(lambda: dict(('%s:%i' % (peer.transport.getPeer().host, peer.transport.getPeer().port), peer.remembered_txs_size) for peer in p2p_node.peers.itervalues())))
     web_root.putChild('pings', WebInterface(defer.inlineCallbacks(lambda: defer.returnValue(
         dict([(a, (yield b)) for a, b in
             [(
@@ -214,7 +218,12 @@ def get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, 
     ))))
     web_root.putChild('peer_versions', WebInterface(lambda: dict(('%s:%i' % peer.addr, peer.other_sub_version) for peer in p2p_node.peers.itervalues())))
     web_root.putChild('payout_addr', WebInterface(lambda: bitcoin_data.pubkey_hash_to_address(my_pubkey_hash, net.PARENT)))
-    web_root.putChild('recent_blocks', WebInterface(lambda: [dict(ts=s.timestamp, hash='%064x' % s.header_hash) for s in tracker.get_chain(best_share_var.value, 24*60*60//net.SHARE_PERIOD) if s.pow_hash <= s.header['bits'].target]))
+    web_root.putChild('recent_blocks', WebInterface(lambda: [dict(
+        ts=s.timestamp,
+        hash='%064x' % s.header_hash,
+        number=pack.IntType(24).unpack(s.share_data['coinbase'][1:4]),
+        share='%064x' % s.hash,
+    ) for s in tracker.get_chain(best_share_var.value, min(tracker.get_height(best_share_var.value), 24*60*60//net.SHARE_PERIOD)) if s.pow_hash <= s.header['bits'].target]))
     web_root.putChild('uptime', WebInterface(lambda: time.time() - start_time))
     web_root.putChild('stale_rates', WebInterface(lambda: p2pool_data.get_stale_counts(tracker, best_share_var.value, 720, rates=True)))
     
@@ -403,19 +412,23 @@ def get_web_root(tracker, bitcoind_work, get_current_txouts, datadir_path, net, 
     def _(name, bytes):
         hd.datastreams['traffic_rate'].add_datum(time.time(), {name: bytes})
     def add_point():
-        if tracker.get_height(best_share_var.value) < 720:
-            return
+        if tracker.get_height(best_share_var.value) < 10:
+            return None
+        lookbehind = min(net.CHAIN_LENGTH, 60*60//net.SHARE_PERIOD, tracker.get_height(best_share_var.value))
         t = time.time()
-        hd.datastreams['pool_rates'].add_datum(t, p2pool_data.get_stale_counts(tracker, best_share_var.value, 720, rates=True))
+        
+        hd.datastreams['pool_rates'].add_datum(t, p2pool_data.get_stale_counts(tracker, best_share_var.value, lookbehind, rates=True))
+        
         current_txouts = get_current_txouts()
         hd.datastreams['current_payout'].add_datum(t, current_txouts.get(bitcoin_data.pubkey_hash_to_script2(my_pubkey_hash), 0)*1e-8)
         miner_hash_rates, miner_dead_hash_rates = get_local_rates()
         current_txouts_by_address = dict((bitcoin_data.script2_to_address(script, net.PARENT), amount) for script, amount in current_txouts.iteritems())
         hd.datastreams['current_payouts'].add_datum(t, dict((user, current_txouts_by_address[user]*1e-8) for user in miner_hash_rates if user in current_txouts_by_address))
+        
         hd.datastreams['incoming_peers'].add_datum(t, sum(1 for peer in p2p_node.peers.itervalues() if peer.incoming))
         hd.datastreams['outgoing_peers'].add_datum(t, sum(1 for peer in p2p_node.peers.itervalues() if not peer.incoming))
         
-        vs = p2pool_data.get_desired_version_counts(tracker, best_share_var.value, 720)
+        vs = p2pool_data.get_desired_version_counts(tracker, best_share_var.value, lookbehind)
         vs_total = sum(vs.itervalues())
         hd.datastreams['desired_versions'].add_datum(t, dict((str(k), v/vs_total) for k, v in vs.iteritems()))
     task.LoopingCall(add_point).start(5)
