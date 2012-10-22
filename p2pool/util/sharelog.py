@@ -49,7 +49,7 @@ class PseudoShareTracker:
                 self.count_in_block.incr()
             logfile.write('%.6f pseudo hash:%064x doa:%s dup:%s user:%s\n' % (timestamp, header_hash, 'yes' if doa else 'no', 'yes' if duplicate else 'no', user))
 
-        @wb.tracker.verified.added.watch
+        @wb.node.tracker.verified.added.watch
         def _(share):#, timestamp, pseudo_share_count):
             data = {}
             data['timestamp'] = clock()
@@ -77,7 +77,7 @@ class PseudoShareTracker:
 
             if share.pow_hash <= share.header['bits'].target:
                 data.update({
-                    'pay':share.check(wb.tracker).get(bitcoin_data.pubkey_hash_to_script2(wb.my_pubkey_hash), 0)*1e-8, 
+                    'pay':share.check(wb.node.tracker).get(bitcoin_data.pubkey_hash_to_script2(wb.my_pubkey_hash), 0)*1e-8, 
                     'subsidy':share.share_info['share_data']['subsidy']*1e-8
                 })
                 logfile.write('%(timestamp).6f block share:%(share_hash)s prev:%(prev_hash)s hash:%(pow_hash)064x db:%(block_dflty).8f acc:%(accepted)d dup:%(duplicates)d rej:%(rejected)d block:%(block_count)d pay:%(pay).8f subsidy:%(subsidy).8f\n' % data)
