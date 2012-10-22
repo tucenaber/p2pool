@@ -19,7 +19,10 @@ from twisted.python import log
 from nattraverso import portmapper, ipdiscover
 
 import bitcoin.p2p as bitcoin_p2p, bitcoin.data as bitcoin_data
-from util import sharelog
+from bitcoin import worker_interface, helper
+from util import fixargparse, jsonrpc, variable, deferral, math, logging, sharelog
+from . import networks, web, work
+import p2pool, p2pool.data as p2pool_data, p2pool.node as p2pool_node
 
 @defer.inlineCallbacks
 def main(args, net, datadir_path, merged_urls, worker_endpoint):
