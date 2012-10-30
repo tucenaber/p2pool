@@ -274,14 +274,14 @@ class Share(object):
     def get_other_tx_hashes(self, tracker):
         return []
     
-    def get_other_txs(self, tracker, known_txs):
-        return []
-    
-    def get_other_txs_size(self, tracker, known_txs):
-        return 0
-    
-    def get_new_txs_size(self, known_txs):
-        return 0
+    def should_punish_reason(self, previous_block, bits, tracker, known_txs):
+        if (self.header['previous_block'], self.header['bits']) != (previous_block, bits) and self.header_hash != previous_block and self.peer is not None:
+            return True, 'Block-stale detected! %x < %x' % (self.header['previous_block'], previous_block)
+        
+        if self.pow_hash <= self.header['bits'].target:
+            return -1, 'block solution'
+        
+        return False, None
     
     def as_block(self, tracker, known_txs):
         if self.other_txs is None:
@@ -388,7 +388,7 @@ class NewShare(object):
                     break
             else:
                 if known_txs is not None:
-                    this_size = len(bitcoin_data.tx_type.pack(known_txs[tx_hash]))
+                    this_size = bitcoin_data.tx_type.packed_size(known_txs[tx_hash])
                     if new_transaction_size + this_size > 50000: # only allow 50 kB of new txns/share
                         break
                     new_transaction_size += this_size
@@ -537,7 +537,7 @@ class NewShare(object):
     def get_other_tx_hashes(self, tracker):
         return [tracker.items[tracker.get_nth_parent_hash(self.hash, x['share_count'])].share_info['new_transaction_hashes'][x['tx_count']] for x in self.share_info['transaction_hash_refs']]
     
-    def get_other_txs(self, tracker, known_txs):
+    def _get_other_txs(self, tracker, known_txs):
         other_tx_hashes = self.get_other_tx_hashes(tracker)
         
         if not all(tx_hash in known_txs for tx_hash in other_tx_hashes):
@@ -545,19 +545,29 @@ class NewShare(object):
         
         return [known_txs[tx_hash] for tx_hash in other_tx_hashes]
     
-    def get_other_txs_size(self, tracker, known_txs):
-        other_txs = self.get_other_txs(tracker, known_txs)
+    def should_punish_reason(self, previous_block, bits, tracker, known_txs):
+        if (self.header['previous_block'], self.header['bits']) != (previous_block, bits) and self.header_hash != previous_block and self.peer is not None:
+            return True, 'Block-stale detected! %x < %x' % (self.header['previous_block'], previous_block)
+        
+        if self.pow_hash <= self.header['bits'].target:
+            return -1, 'block solution'
+        
+        other_txs = self._get_other_txs(tracker, known_txs)
         if other_txs is None:
-            return None # not all txs present
-        size = sum(len(bitcoin_data.tx_type.pack(tx)) for tx in other_txs)
-    
-    def get_new_txs_size(self, known_txs):
-        if not all(tx_hash in known_txs for tx_hash in self.share_info['new_transaction_hashes']):
-            return None # not all txs present
-        return sum(len(bitcoin_data.tx_type.pack(known_txs[tx_hash])) for tx_hash in self.share_info['new_transaction_hashes'])
+            return True, 'not all txs present'
+        else:
+            all_txs_size = sum(bitcoin_data.tx_type.packed_size(tx) for tx in other_txs)
+            if all_txs_size > 1000000:
+                return True, 'txs over block size limit'
+            
+            new_txs_size = sum(bitcoin_data.tx_type.packed_size(known_txs[tx_hash]) for tx_hash in self.share_info['new_transaction_hashes'])
+            if new_txs_size > 50000:
+                return True, 'new txs over limit'
+        
+        return False, None
     
     def as_block(self, tracker, known_txs):
-        other_txs = self.get_other_txs(tracker, known_txs)
+        other_txs = self._get_other_txs(tracker, known_txs)
         if other_txs is None:
             return None # not all txs present
         return dict(header=self.header, txs=[self.check(tracker)] + other_txs)
@@ -691,11 +701,7 @@ class OkayTracker(forest.Tracker):
         decorated_heads = sorted(((
             self.verified.get_work(self.verified.get_nth_parent_hash(h, min(5, self.verified.get_height(h)))),
             #self.items[h].peer is None,
-            self.items[h].pow_hash <= self.items[h].header['bits'].target, # is block solution
-            (self.items[h].header['previous_block'], self.items[h].header['bits']) == (previous_block, bits) or self.items[h].peer is None,
-            self.items[h].get_other_txs(self, known_txs) is not None,
-            self.items[h].get_other_txs_size(self, known_txs) < 1000000,
-            self.items[h].get_new_txs_size(known_txs) < 50000,
+            -self.items[h].should_punish_reason(previous_block, bits, self, known_txs)[0],
             -self.items[h].time_seen,
         ), h) for h in self.verified.tails.get(best_tail, []))
         if p2pool.DEBUG:
@@ -704,68 +710,12 @@ class OkayTracker(forest.Tracker):
                 print '   ', format_hash(head_hash), format_hash(self.items[head_hash].previous_hash), score
         best_head_score, best = decorated_heads[-1] if decorated_heads else (None, None)
         
-        # eat away at heads
-        if decorated_heads:
-            for i in xrange(1000):
-                to_remove = set()
-                for share_hash, tail in self.heads.iteritems():
-                    if share_hash in [head_hash for score, head_hash in decorated_heads[-5:]]:
-                        #print 1
-                        continue
-                    if self.items[share_hash].time_seen > time.time() - 300:
-                        #print 2
-                        continue
-                    if share_hash not in self.verified.items and max(self.items[after_tail_hash].time_seen for after_tail_hash in self.reverse.get(tail)) > time.time() - 120: # XXX stupid
-                        #print 3
-                        continue
-                    to_remove.add(share_hash)
-                if not to_remove:
-                    break
-                for share_hash in to_remove:
-                    if share_hash in self.verified.items:
-                        self.verified.remove(share_hash)
-                    self.remove(share_hash)
-                #print "_________", to_remove
-        
-        # drop tails
-        for i in xrange(1000):
-            to_remove = set()
-            for tail, heads in self.tails.iteritems():
-                if min(self.get_height(head) for head in heads) < 2*self.net.CHAIN_LENGTH + 10:
-                    continue
-                for aftertail in self.reverse.get(tail, set()):
-                    if len(self.reverse[self.items[aftertail].previous_hash]) > 1: # XXX
-                        print "raw"
-                        continue
-                    to_remove.add(aftertail)
-            if not to_remove:
-                break
-            # if removed from this, it must be removed from verified
-            #start = time.time()
-            for aftertail in to_remove:
-                if self.items[aftertail].previous_hash not in self.tails:
-                    print "erk", aftertail, self.items[aftertail].previous_hash
-                    continue
-                if aftertail in self.verified.items:
-                    self.verified.remove(aftertail)
-                self.remove(aftertail)
-            #end = time.time()
-            #print "removed! %i %f" % (len(to_remove), (end - start)/len(to_remove))
-        
         if best is not None:
             best_share = self.items[best]
-            if (best_share.header['previous_block'], best_share.header['bits']) != (previous_block, bits) and best_share.header_hash != previous_block and best_share.peer is not None:
+            punish, punish_reason = best_share.should_punish_reason(previous_block, bits, self, known_txs)
+            if punish > 0:
                 if p2pool.DEBUG:
-                    print 'Stale detected! %x < %x' % (best_share.header['previous_block'], previous_block)
-                best = best_share.previous_hash
-            elif best_share.get_other_txs(self, known_txs) is None:
-                print 'Share with incomplete transactions detected! Jumping from %s to %s!' % (format_hash(best), format_hash(best_share.previous_hash))
-                best = best_share.previous_hash
-            elif best_share.get_other_txs_size(self, known_txs) > 1000000:
-                print >>sys.stderr, 'Share with too many transactions detected! Jumping from %s to %s!' % (format_hash(best), format_hash(best_share.previous_hash))
-                best = best_share.previous_hash
-            elif best_share.get_new_txs_size(known_txs) > 50000:
-                print >>sys.stderr, 'Share with too many new transactions detected! Jumping from %s to %s!' % (format_hash(best), format_hash(best_share.previous_hash))
+                    print >>sys.stderr, 'Punishing share for %r! Jumping from %s to %s!' % (punish_reason, format_hash(best), format_hash(best_share.previous_hash))
                 best = best_share.previous_hash
             
             timestamp_cutoff = min(int(time.time()), best_share.timestamp) - 3600
@@ -779,7 +729,7 @@ class OkayTracker(forest.Tracker):
             for peer, hash, ts, targ in desired:
                 print '   ', '%s:%i' % peer.addr if peer is not None else None, format_hash(hash), math.format_dt(time.time() - ts), bitcoin_data.target_to_difficulty(targ), ts >= timestamp_cutoff, targ <= target_cutoff
         
-        return best, [(peer, hash) for peer, hash, ts, targ in desired if ts >= timestamp_cutoff]
+        return best, [(peer, hash) for peer, hash, ts, targ in desired if ts >= timestamp_cutoff], decorated_heads
     
     def score(self, share_hash, block_rel_height_func):
         # returns approximate lower bound on chain's hashrate in the last self.net.CHAIN_LENGTH*15//16*self.net.SHARE_PERIOD time
