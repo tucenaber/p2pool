@@ -97,7 +97,8 @@ class Protocol(p2protocol.Protocol):
         if p2pool.DEBUG:
             print "Bad peer banned:", self.addr
         self.transport.loseConnection()
-        self.node.bans[self.transport.getPeer().host] = time.time() + 60*60
+        if self.transport.getPeer().host != '127.0.0.1': # never ban localhost
+            self.node.bans[self.transport.getPeer().host] = time.time() + 60*60
     
     def _timeout(self):
         self.timeout_delayed = None
@@ -152,7 +153,7 @@ class Protocol(p2protocol.Protocol):
         random.expovariate(1/100)][-1])
         
         self._stop_thread2 = deferral.run_repeatedly(lambda: [
-            self.send_addrme(port=self.node.port),
+            self.send_addrme(port=self.node.serverfactory.listen_port.getHost().port),
         random.expovariate(1/(100*len(self.node.peers) + 1))][-1])
         
         if best_share_hash is not None:
@@ -182,16 +183,16 @@ class Protocol(p2protocol.Protocol):
             added = set(after) - set(before)
             removed = set(before) - set(after)
             if added:
-                self.remote_remembered_txs_size += sum(bitcoin_data.tx_type.packed_size(after[x]) for x in added)
+                self.remote_remembered_txs_size += sum(100 + bitcoin_data.tx_type.packed_size(after[x]) for x in added)
                 assert self.remote_remembered_txs_size <= self.max_remembered_txs_size
                 fragment(self.send_remember_tx, tx_hashes=[x for x in added if x in self.remote_tx_hashes], txs=[after[x] for x in added if x not in self.remote_tx_hashes])
             if removed:
                 self.send_forget_tx(tx_hashes=list(removed))
-                self.remote_remembered_txs_size -= sum(bitcoin_data.tx_type.packed_size(before[x]) for x in removed)
+                self.remote_remembered_txs_size -= sum(100 + bitcoin_data.tx_type.packed_size(before[x]) for x in removed)
         watch_id2 = self.node.mining_txs_var.transitioned.watch(update_remote_view_of_my_mining_txs)
         self.connection_lost_event.watch(lambda: self.node.mining_txs_var.transitioned.unwatch(watch_id2))
         
-        self.remote_remembered_txs_size += sum(bitcoin_data.tx_type.packed_size(x) for x in self.node.mining_txs_var.value.values())
+        self.remote_remembered_txs_size += sum(100 + bitcoin_data.tx_type.packed_size(x) for x in self.node.mining_txs_var.value.values())
         assert self.remote_remembered_txs_size <= self.max_remembered_txs_size
         fragment(self.send_remember_tx, tx_hashes=[], txs=self.node.mining_txs_var.value.values())
     
@@ -270,7 +271,7 @@ class Protocol(p2protocol.Protocol):
             
             hashes_to_send = [x for x in tx_hashes if x not in self.node.mining_txs_var.value and x in known_txs]
             
-            new_remote_remembered_txs_size = self.remote_remembered_txs_size + sum(bitcoin_data.tx_type.packed_size(known_txs[x]) for x in hashes_to_send)
+            new_remote_remembered_txs_size = self.remote_remembered_txs_size + sum(100 + bitcoin_data.tx_type.packed_size(known_txs[x]) for x in hashes_to_send)
             if new_remote_remembered_txs_size > self.max_remembered_txs_size:
                 raise ValueError('shares have too many txs')
             self.remote_remembered_txs_size = new_remote_remembered_txs_size
@@ -282,7 +283,7 @@ class Protocol(p2protocol.Protocol):
         if self.other_version >= 8:
             res = self.send_forget_tx(tx_hashes=hashes_to_send)
             
-            self.remote_remembered_txs_size -= sum(bitcoin_data.tx_type.packed_size(known_txs[x]) for x in hashes_to_send)
+            self.remote_remembered_txs_size -= sum(100 + bitcoin_data.tx_type.packed_size(known_txs[x]) for x in hashes_to_send)
         
         return res
     
@@ -324,13 +325,15 @@ class Protocol(p2protocol.Protocol):
         ('tx_hashes', pack.ListType(pack.IntType(256))),
     ])
     def handle_have_tx(self, tx_hashes):
-        assert self.remote_tx_hashes.isdisjoint(tx_hashes)
+        #assert self.remote_tx_hashes.isdisjoint(tx_hashes)
         self.remote_tx_hashes.update(tx_hashes)
+        while len(self.remote_tx_hashes) > 10000:
+            self.remote_tx_hashes.pop()
     message_losing_tx = pack.ComposedType([
         ('tx_hashes', pack.ListType(pack.IntType(256))),
     ])
     def handle_losing_tx(self, tx_hashes):
-        assert self.remote_tx_hashes.issuperset(tx_hashes)
+        #assert self.remote_tx_hashes.issuperset(tx_hashes)
         self.remote_tx_hashes.difference_update(tx_hashes)
     
     
@@ -359,7 +362,7 @@ class Protocol(p2protocol.Protocol):
                     return
             
             self.remembered_txs[tx_hash] = tx
-            self.remembered_txs_size += bitcoin_data.tx_type.packed_size(tx)
+            self.remembered_txs_size += 100 + bitcoin_data.tx_type.packed_size(tx)
         new_known_txs = dict(self.node.known_txs_var.value)
         warned = False
         for tx in txs:
@@ -374,7 +377,7 @@ class Protocol(p2protocol.Protocol):
                 warned = True
             
             self.remembered_txs[tx_hash] = tx
-            self.remembered_txs_size += bitcoin_data.tx_type.packed_size(tx)
+            self.remembered_txs_size += 100 + bitcoin_data.tx_type.packed_size(tx)
             new_known_txs[tx_hash] = tx
         self.node.known_txs_var.set(new_known_txs)
         if self.remembered_txs_size >= self.max_remembered_txs_size:
@@ -384,7 +387,7 @@ class Protocol(p2protocol.Protocol):
     ])
     def handle_forget_tx(self, tx_hashes):
         for tx_hash in tx_hashes:
-            self.remembered_txs_size -= bitcoin_data.tx_type.packed_size(self.remembered_txs[tx_hash])
+            self.remembered_txs_size -= 100 + bitcoin_data.tx_type.packed_size(self.remembered_txs[tx_hash])
             assert self.remembered_txs_size >= 0
             del self.remembered_txs[tx_hash]
     
