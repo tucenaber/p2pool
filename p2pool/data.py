@@ -311,10 +311,15 @@ class NewNewShare(object):
         return gentx # only used by as_block
     
     def get_other_tx_hashes(self, tracker):
+        parents = tracker.get_height(self.hash) - 1
+        if not all(x['share_count'] <= parents for x in self.share_info['transaction_hash_refs']):
+            return None
         return [tracker.items[tracker.get_nth_parent_hash(self.hash, x['share_count'])].share_info['new_transaction_hashes'][x['tx_count']] for x in self.share_info['transaction_hash_refs']]
     
     def _get_other_txs(self, tracker, known_txs):
         other_tx_hashes = self.get_other_tx_hashes(tracker)
+        if other_tx_hashes is None:
+            return None # not all parents present
         
         if not all(tx_hash in known_txs for tx_hash in other_tx_hashes):
             return None # not all txs present
@@ -849,10 +854,15 @@ class NewShare(object):
         return gentx # only used by as_block
     
     def get_other_tx_hashes(self, tracker):
+        parents = tracker.get_height(self.hash) - 1
+        if not all(x['share_count'] <= parents for x in self.share_info['transaction_hash_refs']):
+            return None
         return [tracker.items[tracker.get_nth_parent_hash(self.hash, x['share_count'])].share_info['new_transaction_hashes'][x['tx_count']] for x in self.share_info['transaction_hash_refs']]
     
     def _get_other_txs(self, tracker, known_txs):
         other_tx_hashes = self.get_other_tx_hashes(tracker)
+        if other_tx_hashes is None:
+            return None # not all parents present
         
         if not all(tx_hash in known_txs for tx_hash in other_tx_hashes):
             return None # not all txs present
@@ -1121,7 +1131,8 @@ def get_warnings(tracker, best_share, net, bitcoind_warning, bitcoind_work_value
                 majority_desired_version, 100*desired_version_counts[majority_desired_version]/sum(desired_version_counts.itervalues())))
     
     if bitcoind_warning is not None:
-        res.append('(from bitcoind) %s' % (bitcoind_warning,))
+        if 'This is a pre-release test build' not in bitcoind_warning:
+            res.append('(from bitcoind) %s' % (bitcoind_warning,))
     
     if time.time() > bitcoind_work_value['last_update'] + 60:
         res.append('''LOST CONTACT WITH BITCOIND for %s! Check that it isn't frozen or dead!''' % (math.format_dt(time.time() - bitcoind_work_value['last_update']),))
