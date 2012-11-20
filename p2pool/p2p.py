@@ -153,7 +153,7 @@ class Protocol(p2protocol.Protocol):
         random.expovariate(1/100)][-1])
         
         self._stop_thread2 = deferral.run_repeatedly(lambda: [
-            self.send_addrme(port=self.node.serverfactory.listen_port.getHost().port),
+            self.send_addrme(port=self.node.serverfactory.listen_port.getHost().port) if self.node.serverfactory.listen_port is not None else None,
         random.expovariate(1/(100*len(self.node.peers) + 1))][-1])
         
         if best_share_hash is not None:
@@ -267,7 +267,9 @@ class Protocol(p2protocol.Protocol):
             tx_hashes = set()
             for share in shares:
                 if share.hash in include_txs_with:
-                    tx_hashes.update(share.get_other_tx_hashes(tracker))
+                    x = share.get_other_tx_hashes(tracker)
+                    if x is not None:
+                        tx_hashes.update(x)
             
             hashes_to_send = [x for x in tx_hashes if x not in self.node.mining_txs_var.value and x in known_txs]
             
@@ -420,6 +422,7 @@ class ServerFactory(protocol.ServerFactory):
         
         self.conns = {}
         self.running = False
+        self.listen_port = None
     
     def buildProtocol(self, addr):
         if sum(self.conns.itervalues()) >= self.max_conns or self.conns.get(self._host_to_ident(addr.host), 0) >= 3:
