@@ -161,10 +161,9 @@ class ListType(Type):
     
     def read(self, file):
         length, file = self._inner_size.read(file)
-        res = []
+        res = [None]*length
         for i in xrange(length):
-            item, file = self.type.read(file)
-            res.append(item)
+            res[i], file = self.type.read(file)
         return res, file
     
     def write(self, file, item):
@@ -265,22 +264,26 @@ def get_record(fields):
                 if isinstance(other, dict):
                     return dict(self) == other
                 elif isinstance(other, _Record):
-                    return all(self[k] == other[k] for k in self.keys())
+                    for k in fields:
+                        if getattr(self, k) != getattr(other, k):
+                            return False
+                    return True
                 elif other is None:
                     return False
                 raise TypeError()
             def __ne__(self, other):
                 return not (self == other)
         _record_types[fields] = _Record
-    return _record_types[fields]()
+    return _record_types[fields]
 
 class ComposedType(Type):
     def __init__(self, fields):
-        self.fields = tuple(fields)
+        self.fields = list(fields)
         self.field_names = set(k for k, v in fields)
+        self.record_type = get_record(k for k, v in self.fields)
     
     def read(self, file):
-        item = get_record(k for k, v in self.fields)
+        item = self.record_type()
         for key, type_ in self.fields:
             item[key], file = type_.read(file)
         return item, file

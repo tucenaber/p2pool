@@ -56,7 +56,7 @@ class P2PNode(p2p.Node):
         except:
             log.err(None, 'in handle_share_hashes:')
         else:
-            self.handle_shares([x for x in shares if isinstance(x, p2pool_data.NewNewShare)], peer)
+            self.handle_shares(shares, peer)
     
     def handle_get_shares(self, hashes, parents, stops, peer):
         parents = min(parents, 1000//len(hashes))
@@ -109,7 +109,7 @@ class P2PNode(p2p.Node):
                 try:
                     shares = yield peer.get_shares(
                         hashes=[share_hash],
-                        parents=49,
+                        parents=500,
                         stops=list(set(self.node.tracker.heads) | set(
                             self.node.tracker.get_nth_parent_hash(head, min(max(0, self.node.tracker.get_height_and_last(head)[0] - 1), 10)) for head in self.node.tracker.heads
                         ))[:100],
@@ -265,6 +265,8 @@ class Node(object):
             print
         
         def forget_old_txs():
+            print "KNOWN:", sum(bitcoin_data.tx_type.packed_size(tx) for tx in self.known_txs_var.value.itervalues())
+            print "MINING:", sum(bitcoin_data.tx_type.packed_size(tx) for tx in self.mining_txs_var.value.itervalues())
             new_known_txs = {}
             if self.p2p_node is not None:
                 for peer in self.p2p_node.peers.itervalues():
