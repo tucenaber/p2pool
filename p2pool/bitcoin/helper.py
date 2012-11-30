@@ -1,7 +1,7 @@
 import sys
 import time
 
-from twisted.internet import defer
+from twisted.internet import reactor, defer
 
 import p2pool
 from p2pool.bitcoin import data as bitcoin_data
@@ -42,7 +42,7 @@ def getwork(bitcoind, use_getblocktemplate=False):
         except jsonrpc.Error_for_code(-32601): # Method not found
             print >>sys.stderr, 'Error: Bitcoin version too old! Upgrade to v0.5 or newer!'
             raise deferral.RetrySilentlyException()
-    yield defer.execute(log,start,end)
+    reactor.callInThread(log, start, end)
     packed_transactions = [(x['data'] if isinstance(x, dict) else x).decode('hex') for x in work['transactions']]
     if 'height' not in work:
         work['height'] = (yield bitcoind.rpc_getblock(work['previousblockhash']))['height'] + 1
