@@ -1,5 +1,6 @@
 import itertools
 import time
+from twisted.internet import reactor
 from p2pool.util import logging
 from p2pool.bitcoin import data as bitcoin_data
 from p2pool import data as p2pool_data
@@ -47,7 +48,7 @@ class PseudoShareTracker:
                 self.count_in_current.incr()
                 self.count_in_my_share.incr()
                 self.count_in_block.incr()
-            logfile.write('%.6f pseudo hash:%064x doa:%s dup:%s user:%s\n' % (timestamp, header_hash, 'yes' if doa else 'no', 'yes' if duplicate else 'no', user))
+            reactor.callInThread(logfile.write, '%.6f pseudo hash:%064x doa:%s dup:%s user:%s\n' % (timestamp, header_hash, 'yes' if doa else 'no', 'yes' if duplicate else 'no', user))
 
         @wb.node.tracker.verified.added.watch
         def _(share):#, timestamp, pseudo_share_count):
@@ -68,19 +69,19 @@ class PseudoShareTracker:
                  block_count = self.count_in_block.count
             )
 
-            logfile.write('%(timestamp).6f share share:%(share_hash)s prev:%(prev_hash)s hash:%(pow_hash)064x ds:%(share_dflty).8f db:%(block_dflty).8f acc:%(accepted)d dup:%(duplicates)d rej:%(rejected)d own:%(own_count)d block:%(block_count)d\n' % data)
+            reactor.callInThread(logfile.write, '%(timestamp).6f share share:%(share_hash)s prev:%(prev_hash)s hash:%(pow_hash)064x ds:%(share_dflty).8f db:%(block_dflty).8f acc:%(accepted)d dup:%(duplicates)d rej:%(rejected)d own:%(own_count)d block:%(block_count)d\n' % data)
             self.count_in_current.deactivate()
 
             if share.hash in wb.my_share_hashes:
-                logfile.write('%(timestamp).6f mined share:%(share_hash)s prev:%(prev_hash)s hash:%(pow_hash)064x ds:%(share_dflty).8f db:%(block_dflty).8f acc:%(accepted)d dup:%(duplicates)d rej:%(rejected)d own:%(own_count)d block:%(block_count)d\n' % data)
+                reactor.callInThread(logfile.write, '%(timestamp).6f mined share:%(share_hash)s prev:%(prev_hash)s hash:%(pow_hash)064x ds:%(share_dflty).8f db:%(block_dflty).8f acc:%(accepted)d dup:%(duplicates)d rej:%(rejected)d own:%(own_count)d block:%(block_count)d\n' % data)
                 self.count_in_my_share.deactivate()
 
             if share.pow_hash <= share.header['bits'].target:
                 data.update({
-                    'pay':share.check(wb.node.tracker).get(bitcoin_data.pubkey_hash_to_script2(wb.my_pubkey_hash), 0)*1e-8, 
+                    'pay':share.check(wb.node.tracker).get(bitcoin_data.pubkey_hash_to_script2(wb.my_pubkey_hash), 0)*1e-8,
                     'subsidy':share.share_info['share_data']['subsidy']*1e-8
                 })
-                logfile.write('%(timestamp).6f block share:%(share_hash)s prev:%(prev_hash)s hash:%(pow_hash)064x db:%(block_dflty).8f acc:%(accepted)d dup:%(duplicates)d rej:%(rejected)d block:%(block_count)d pay:%(pay).8f subsidy:%(subsidy).8f\n' % data)
+                reactor.callInThread(logfile.write, '%(timestamp).6f block share:%(share_hash)s prev:%(prev_hash)s hash:%(pow_hash)064x db:%(block_dflty).8f acc:%(accepted)d dup:%(duplicates)d rej:%(rejected)d block:%(block_count)d pay:%(pay).8f subsidy:%(subsidy).8f\n' % data)
                 self.count_in_block.deactivate()
 
         @wb.new_work_event.watch
