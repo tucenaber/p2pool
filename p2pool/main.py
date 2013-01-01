@@ -19,8 +19,8 @@ from twisted.python import log
 from nattraverso import portmapper, ipdiscover
 
 import bitcoin.p2p as bitcoin_p2p, bitcoin.data as bitcoin_data
-from bitcoin import worker_interface, helper
-from util import fixargparse, jsonrpc, variable, deferral, math, logging, sharelog
+from bitcoin import stratum, worker_interface, helper
+from util import fixargparse, jsonrpc, variable, deferral, math, logging, switchprotocol, sharelog
 from . import networks, web, work
 import p2pool, p2pool.data as p2pool_data, p2pool.node as p2pool_node
 
@@ -29,7 +29,7 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
     try:
         print 'p2pool (version %s)' % (p2pool.__version__,)
         print
-        
+
         @defer.inlineCallbacks
         def connect_p2p():
             # connect to bitcoind over bitcoin-p2p
@@ -40,17 +40,17 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
             print '    ...success!'
             print
             defer.returnValue(factory)
-        
+
         if args.testnet: # establish p2p connection first if testnet so bitcoind can work without connections
             factory = yield connect_p2p()
-        
+
         # connect to bitcoind over JSON-RPC and do initial getmemorypool
         url = '%s://%s:%i/' % ('https' if args.bitcoind_rpc_ssl else 'http', args.bitcoind_address, args.bitcoind_rpc_port)
         print '''Testing bitcoind RPC connection to '%s' with username '%s'...''' % (url, args.bitcoind_rpc_username)
-        bitcoind = jsonrpc.Proxy(url, dict(Authorization='Basic ' + base64.b64encode(args.bitcoind_rpc_username + ':' + args.bitcoind_rpc_password)), timeout=30)
+        bitcoind = jsonrpc.HTTPProxy(url, dict(Authorization='Basic ' + base64.b64encode(args.bitcoind_rpc_username + ':' + args.bitcoind_rpc_password)), timeout=30)
         yield helper.check(bitcoind, net)
         temp_work = yield helper.getwork(bitcoind)
-        
+
         bitcoind_warning_var = variable.Variable(None)
         @defer.inlineCallbacks
         def poll_warnings():
@@ -58,45 +58,45 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
             bitcoind_warning_var.set(errors if errors != '' else None)
         yield poll_warnings()
         task.LoopingCall(poll_warnings).start(20*60)
-        
+
         print '    ...success!'
         print '    Current block hash: %x' % (temp_work['previous_block'],)
         print '    Current block height: %i' % (temp_work['height'] - 1,)
         print
-        
+
         if not args.testnet:
             factory = yield connect_p2p()
-        
+
         print 'Determining payout address...'
         if args.pubkey_hash is None:
             address_path = os.path.join(datadir_path, 'cached_payout_address')
-            
+
             if os.path.exists(address_path):
                 with open(address_path, 'rb') as f:
                     address = f.read().strip('\r\n')
                 print '    Loaded cached address: %s...' % (address,)
             else:
                 address = None
-            
+
             if address is not None:
                 res = yield deferral.retry('Error validating cached address:', 5)(lambda: bitcoind.rpc_validateaddress(address))()
                 if not res['isvalid'] or not res['ismine']:
                     print '    Cached address is either invalid or not controlled by local bitcoind!'
                     address = None
-            
+
             if address is None:
                 print '    Getting payout address from bitcoind...'
                 address = yield deferral.retry('Error getting payout address from bitcoind:', 5)(lambda: bitcoind.rpc_getaccountaddress('p2pool'))()
-            
+
             with open(address_path, 'wb') as f:
                 f.write(address)
-            
+
             my_pubkey_hash = bitcoin_data.address_to_pubkey_hash(address, net.PARENT)
         else:
             my_pubkey_hash = args.pubkey_hash
         print '    ...success! Payout address:', bitcoin_data.pubkey_hash_to_address(my_pubkey_hash, net.PARENT)
         print
-        
+
         ss = p2pool_data.ShareStore(os.path.join(datadir_path, 'shares.'), net)
         shares = {}
         known_verified = set()
@@ -113,13 +113,13 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                 raise AssertionError()
         print "    ...done loading %i shares (%i verified)!" % (len(shares), len(known_verified))
         print
-        
-        
+
+
         print 'Initializing work...'
-        
+
         node = p2pool_node.Node(factory, bitcoind, shares.values(), known_verified, net)
         yield node.start()
-        
+
         for share_hash in shares:
             if share_hash not in node.tracker.items:
                 ss.forget_share(share_hash)
@@ -129,20 +129,20 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
         del shares, known_verified
         node.tracker.removed.watch(lambda share: ss.forget_share(share.hash))
         node.tracker.verified.removed.watch(lambda share: ss.forget_verified_share(share.hash))
-        
+
         def save_shares():
             for share in node.tracker.get_chain(node.best_share_var.value, min(node.tracker.get_height(node.best_share_var.value), 2*net.CHAIN_LENGTH)):
                 ss.add_share(share)
                 if share.hash in node.tracker.verified.items:
                     ss.add_verified_hash(share.hash)
         task.LoopingCall(save_shares).start(60)
-        
+
         print '    ...success!'
         print
-        
-        
+
+
         print 'Joining p2pool network using port %i...' % (args.p2pool_port,)
-        
+
         @defer.inlineCallbacks
         def parse(x):
             if ':' in x:
@@ -150,7 +150,7 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                 defer.returnValue(((yield reactor.resolve(ip)), int(port)))
             else:
                 defer.returnValue(((yield reactor.resolve(x)), net.P2P_PORT))
-        
+
         addrs = {}
         if os.path.exists(os.path.join(datadir_path, 'addrs')):
             try:
@@ -165,14 +165,14 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                     addrs[addr] = (0, time.time(), time.time())
             except:
                 log.err()
-        
+
         connect_addrs = set()
         for addr_df in map(parse, args.p2pool_nodes):
             try:
                 connect_addrs.add((yield addr_df))
             except:
                 log.err()
-        
+
         node.p2p_node = p2pool_node.P2PNode(node,
             port=args.p2pool_port,
             max_incoming_conns=args.p2pool_conns,
@@ -181,15 +181,15 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
             desired_outgoing_conns=args.p2pool_outgoing_conns,
         )
         node.p2p_node.start()
-        
+
         def save_addrs():
             with open(os.path.join(datadir_path, 'addrs'), 'wb') as f:
                 f.write(json.dumps(node.p2p_node.addr_store.items()))
         task.LoopingCall(save_addrs).start(60)
-        
+
         print '    ...success!'
         print
-        
+
         if args.upnp:
             @defer.inlineCallbacks
             def upnp_thread():
@@ -206,50 +206,53 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                             log.err(None, 'UPnP error:')
                     yield deferral.sleep(random.expovariate(1/120))
             upnp_thread()
-        
+
         # start listening for workers with a JSON-RPC server
-        
+
         print 'Listening for workers on %r port %i...' % (worker_endpoint[0], worker_endpoint[1])
-        
+
         wb = work.WorkerBridge(node, my_pubkey_hash, args.donation_percentage, merged_urls, args.worker_fee)
         web_root = web.get_web_root(wb, datadir_path, bitcoind_warning_var)
-        worker_interface.WorkerInterface(wb).attach_to(web_root, get_handler=lambda request: request.redirect('/static/'))
-        
-        deferral.retry('Error binding to worker port:', traceback=False)(reactor.listenTCP)(worker_endpoint[1], server.Site(web_root), interface=worker_endpoint[0])
+        caching_wb = worker_interface.CachingWorkerBridge(wb)
+        worker_interface.WorkerInterface(caching_wb).attach_to(web_root, get_handler=lambda request: request.redirect('/static/'))
+        web_serverfactory = server.Site(web_root)
+
+        serverfactory = switchprotocol.FirstByteSwitchFactory({'{': stratum.StratumServerFactory(caching_wb)}, web_serverfactory)
+        deferral.retry('Error binding to worker port:', traceback=False)(reactor.listenTCP)(worker_endpoint[1], serverfactory, interface=worker_endpoint[0])
 
         if args.sharelog is None:
             sharelogfile = os.path.join(datadir_path, 'sharelog')
         else:
             sharelogfile = args.sharelog
         sharelog.PseudoShareTracker().track(wb, logging.TimestampingPipe(logging.LogFile(sharelogfile)))
-        
+
         with open(os.path.join(os.path.join(datadir_path, 'ready_flag')), 'wb') as f:
             pass
-        
+
         print '    ...success!'
         print
-        
-        
+
+
         # done!
         print 'Started successfully!'
         print 'Go to http://127.0.0.1:%i/ to view graphs and statistics!' % (worker_endpoint[1],)
-        if args.donation_percentage > 0.51:
+        if args.donation_percentage > 1.1:
             print '''Donating %.1f%% of work towards P2Pool's development. Thanks for the tip!''' % (args.donation_percentage,)
-        elif args.donation_percentage < 0.49:
+        elif args.donation_percentage < .9:
             print '''Donating %.1f%% of work towards P2Pool's development. Please donate to encourage further development of P2Pool!''' % (args.donation_percentage,)
         else:
             print '''Donating %.1f%% of work towards P2Pool's development. Thank you!''' % (args.donation_percentage,)
             print 'You can increase this amount with --give-author argument! (or decrease it, if you must)'
         print
-        
-        
+
+
         if hasattr(signal, 'SIGALRM'):
             signal.signal(signal.SIGALRM, lambda signum, frame: reactor.callFromThread(
                 sys.stderr.write, 'Watchdog timer went off at:\n' + ''.join(traceback.format_stack())
             ))
             signal.siginterrupt(signal.SIGALRM, False)
             task.LoopingCall(signal.alarm, 30).start(1)
-        
+
         if args.irc_announce:
             from twisted.words.protocols import irc
             class IRCClient(irc.IRCClient):
@@ -293,7 +296,7 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
             class IRCClientFactory(protocol.ReconnectingClientFactory):
                 protocol = IRCClient
             reactor.connectTCP("irc.freenode.net", 6667, IRCClientFactory())
-        
+
         @defer.inlineCallbacks
         def status_thread():
             last_str = None
@@ -309,7 +312,7 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                         len(node.p2p_node.peers),
                         sum(1 for peer in node.p2p_node.peers.itervalues() if peer.incoming),
                     ) + (' FDs: %i R/%i W' % (len(reactor.getReaders()), len(reactor.getWriters())) if p2pool.DEBUG else '')
-                    
+
                     datums, dt = wb.local_rate_monitor.get_datums_in_last()
                     my_att_s = sum(datum['work']/dt for datum in datums)
                     this_str += '\n Local: %sH/s in last %s Local dead on arrival: %s Expected time to share: %s' % (
@@ -318,12 +321,12 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                         math.format_binomial_conf(sum(1 for datum in datums if datum['dead']), len(datums), 0.95),
                         math.format_dt(2**256 / node.tracker.items[node.best_share_var.value].max_target / my_att_s) if my_att_s and node.best_share_var.value else '???',
                     )
-                    
+
                     if height > 2:
                         (stale_orphan_shares, stale_doa_shares), shares, _ = wb.get_stale_counts()
                         stale_prop = p2pool_data.get_average_stale_prop(node.tracker, node.best_share_var.value, min(60*60//net.SHARE_PERIOD, height))
                         real_att_s = p2pool_data.get_pool_attempts_per_second(node.tracker, node.best_share_var.value, min(height - 1, 60*60//net.SHARE_PERIOD)) / (1 - stale_prop)
-                        
+
                         this_str += '\n Shares: %i (%i orphan, %i dead) Stale rate: %s Efficiency: %s Current payout: %.4f %s' % (
                             shares, stale_orphan_shares, stale_doa_shares,
                             math.format_binomial_conf(stale_orphan_shares + stale_doa_shares, shares, 0.95),
@@ -335,12 +338,12 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
                             100*stale_prop,
                             math.format_dt(2**256 / node.bitcoind_work.value['bits'].target / real_att_s),
                         )
-                        
+
                         for warning in p2pool_data.get_warnings(node.tracker, node.best_share_var.value, net, bitcoind_warning_var.value, node.bitcoind_work.value):
                             print >>sys.stderr, '#'*40
                             print >>sys.stderr, '>>> Warning: ' + warning
                             print >>sys.stderr, '#'*40
-                    
+
                     if this_str != last_str or time.time() > last_time + 15:
                         print this_str
                         last_str = this_str
@@ -354,7 +357,7 @@ def main(args, net, datadir_path, merged_urls, worker_endpoint):
 
 def run():
     realnets = dict((name, net) for name, net in networks.nets.iteritems() if '_testnet' not in name)
-    
+
     parser = fixargparse.FixedArgumentParser(description='p2pool (version %s)' % (p2pool.__version__,), fromfile_prefix_chars='@')
     parser.add_argument('--version', action='version', version=p2pool.__version__)
     parser.add_argument('--net',
@@ -382,8 +385,8 @@ def run():
         help='call getauxblock on this url to get work for merged mining (example: http://ncuser:ncpass@127.0.0.1:10332/)',
         type=str, action='append', default=[], dest='merged_urls')
     parser.add_argument('--give-author', metavar='DONATION_PERCENTAGE',
-        help='donate this percentage of work towards the development of p2pool (default: 0.5)',
-        type=float, action='store', default=0.5, dest='donation_percentage')
+        help='donate this percentage of work towards the development of p2pool (default: 1.0)',
+        type=float, action='store', default=1.0, dest='donation_percentage')
     parser.add_argument('--iocp',
         help='use Windows IOCP API in order to avoid errors due to large number of sockets being open',
         action='store_true', default=False, dest='iocp')
@@ -393,7 +396,7 @@ def run():
     parser.add_argument('--no-bugreport',
         help='disable submitting caught exceptions to the author',
         action='store_true', default=False, dest='no_bugreport')
-    
+
     p2pool_group = parser.add_argument_group('p2pool interface')
     p2pool_group.add_argument('--p2pool-port', metavar='PORT',
         help='use port PORT to listen for connections (forward this port from your router!) (default: %s)' % ', '.join('%s:%i' % (name, net.P2P_PORT) for name, net in sorted(realnets.items())),
@@ -410,7 +413,7 @@ def run():
     p2pool_group.add_argument('--outgoing-conns', metavar='CONNS',
         help='outgoing connections (default: 6)',
         type=int, action='store', default=6, dest='p2pool_outgoing_conns')
-    
+
     worker_group = parser.add_argument_group('worker interface')
     worker_group.add_argument('-w', '--worker-port', metavar='PORT or ADDR:PORT',
         help='listen on PORT on interface with ADDR for RPC connections from miners (default: all interfaces, %s)' % ', '.join('%s:%i' % (name, net.WORKER_PORT) for name, net in sorted(realnets.items())),
@@ -418,7 +421,7 @@ def run():
     worker_group.add_argument('-f', '--fee', metavar='FEE_PERCENTAGE',
         help='''charge workers mining to their own bitcoin address (by setting their miner's username to a bitcoin address) this percentage fee to mine on your p2pool instance. Amount displayed at http://127.0.0.1:WORKER_PORT/fee (default: 0)''',
         type=float, action='store', default=0, dest='worker_fee')
-    
+
     bitcoind_group = parser.add_argument_group('bitcoind interface')
     bitcoind_group.add_argument('--bitcoind-address', metavar='BITCOIND_ADDRESS',
         help='connect to this address (default: 127.0.0.1)',
@@ -432,30 +435,30 @@ def run():
     bitcoind_group.add_argument('--bitcoind-p2p-port', metavar='BITCOIND_P2P_PORT',
         help='''connect to P2P interface at this port (default: %s <read from bitcoin.conf if password not provided>)''' % ', '.join('%s:%i' % (name, net.PARENT.P2P_PORT) for name, net in sorted(realnets.items())),
         type=int, action='store', default=None, dest='bitcoind_p2p_port')
-    
+
     bitcoind_group.add_argument(metavar='BITCOIND_RPCUSERPASS',
         help='bitcoind RPC interface username, then password, space-separated (only one being provided will cause the username to default to being empty, and none will cause P2Pool to read them from bitcoin.conf)',
         type=str, action='store', default=[], nargs='*', dest='bitcoind_rpc_userpass')
-    
+
     args = parser.parse_args()
-    
+
     if args.debug:
         p2pool.DEBUG = True
         defer.setDebugging(True)
     else:
         p2pool.DEBUG = False
-    
+
     net_name = args.net_name + ('_testnet' if args.testnet else '')
     net = networks.nets[net_name]
-    
+
     datadir_path = os.path.join((os.path.join(os.path.dirname(sys.argv[0]), 'data') if args.datadir is None else args.datadir), net_name)
     if not os.path.exists(datadir_path):
         os.makedirs(datadir_path)
-    
+
     if len(args.bitcoind_rpc_userpass) > 2:
         parser.error('a maximum of two arguments are allowed')
     args.bitcoind_rpc_username, args.bitcoind_rpc_password = ([None, None] + args.bitcoind_rpc_userpass)[-2:]
-    
+
     if args.bitcoind_rpc_password is None:
         conf_path = net.PARENT.CONF_FILE_FUNC()
         if not os.path.exists(conf_path):
@@ -485,22 +488,22 @@ def run():
                 setattr(args, var_name, var_type(contents[conf_name]))
         if args.bitcoind_rpc_password is None:
             parser.error('''Bitcoin configuration file didn't contain an rpcpassword= line! Add one!''')
-    
+
     if args.bitcoind_rpc_username is None:
         args.bitcoind_rpc_username = ''
-    
+
     if args.bitcoind_rpc_port is None:
         args.bitcoind_rpc_port = net.PARENT.RPC_PORT
-    
+
     if args.bitcoind_p2p_port is None:
         args.bitcoind_p2p_port = net.PARENT.P2P_PORT
-    
+
     if args.p2pool_port is None:
         args.p2pool_port = net.P2P_PORT
-    
+
     if args.p2pool_outgoing_conns > 10:
         parser.error('''--outgoing-conns can't be more than 10''')
-    
+
     if args.worker_endpoint is None:
         worker_endpoint = '', net.WORKER_PORT
     elif ':' not in args.worker_endpoint:
@@ -508,7 +511,7 @@ def run():
     else:
         addr, port = args.worker_endpoint.rsplit(':', 1)
         worker_endpoint = addr, int(port)
-    
+
     if args.address is not None:
         try:
             args.pubkey_hash = bitcoin_data.address_to_pubkey_hash(args.address, net.PARENT)
@@ -516,7 +519,7 @@ def run():
             parser.error('error parsing address: ' + repr(e))
     else:
         args.pubkey_hash = None
-    
+
     def separate_url(url):
         s = urlparse.urlsplit(url)
         if '@' not in s.netloc:
@@ -524,10 +527,10 @@ def run():
         userpass, new_netloc = s.netloc.rsplit('@', 1)
         return urlparse.urlunsplit(s._replace(netloc=new_netloc)), userpass
     merged_urls = map(separate_url, args.merged_urls)
-    
+
     if args.logfile is None:
         args.logfile = os.path.join(datadir_path, 'log')
-    
+
     logfile = logging.LogFile(args.logfile)
     pipe = logging.TimestampingPipe(logging.TeePipe([logging.EncodeReplacerPipe(sys.stderr), logfile]))
     sys.stdout = logging.AbortPipe(pipe)
@@ -539,25 +542,25 @@ def run():
             print '...and reopened %r after catching SIGUSR1.' % (args.logfile,)
         signal.signal(signal.SIGUSR1, sigusr1)
     task.LoopingCall(logfile.reopen).start(5)
-    
+
     class ErrorReporter(object):
         def __init__(self):
             self.last_sent = None
-        
+
         def emit(self, eventDict):
             if not eventDict["isError"]:
                 return
-            
+
             if self.last_sent is not None and time.time() < self.last_sent + 5:
                 return
             self.last_sent = time.time()
-            
+
             if 'failure' in eventDict:
                 text = ((eventDict.get('why') or 'Unhandled Error')
                     + '\n' + eventDict['failure'].getTraceback())
             else:
                 text = " ".join([str(m) for m in eventDict["message"]]) + "\n"
-            
+
             from twisted.web import client
             client.getPage(
                 url='http://u.forre.st/p2pool_error.cgi',
@@ -567,6 +570,6 @@ def run():
             ).addBoth(lambda x: None)
     if not args.no_bugreport:
         log.addObserver(ErrorReporter().emit)
-    
+
     reactor.callWhenRunning(main, args, net, datadir_path, merged_urls, worker_endpoint)
     reactor.run()
