@@ -121,22 +121,6 @@ class Share(object):
         max_bits = bitcoin_data.FloatingInteger.from_target_upper_bound(pre_target3)
         bits = bitcoin_data.FloatingInteger.from_target_upper_bound(math.clip(desired_target, (pre_target3//10, pre_target3)))
         
-        weights, total_weight, donation_weight = tracker.get_cumulative_weights(share_data['previous_share_hash'],
-            min(height, net.REAL_CHAIN_LENGTH),
-            65535*net.SPREAD*bitcoin_data.target_to_average_attempts(block_target),
-        )
-        assert total_weight == sum(weights.itervalues()) + donation_weight, (total_weight, sum(weights.itervalues()) + donation_weight)
-        
-        amounts = dict((script, share_data['subsidy']*(199*weight)//(200*total_weight)) for script, weight in weights.iteritems()) # 99.5% goes according to weights prior to this share
-        this_script = bitcoin_data.pubkey_hash_to_script2(share_data['pubkey_hash'])
-        amounts[this_script] = amounts.get(this_script, 0) + share_data['subsidy']//200 # 0.5% goes to block finder
-        amounts[DONATION_SCRIPT] = amounts.get(DONATION_SCRIPT, 0) + share_data['subsidy'] - sum(amounts.itervalues()) # all that's left over is the donation weight and some extra satoshis due to rounding
-        
-        if sum(amounts.itervalues()) != share_data['subsidy'] or any(x < 0 for x in amounts.itervalues()):
-            raise ValueError()
-        
-        dests = sorted(amounts.iterkeys(), key=lambda script: (script == DONATION_SCRIPT, amounts[script], script))[-4000:] # block length limit, unlikely to ever be hit
-        
         new_transaction_hashes = []
         new_transaction_size = 0
         transaction_hash_refs = []
@@ -171,6 +155,22 @@ class Share(object):
             assert base_subsidy is not None
             share_data = dict(share_data, subsidy=base_subsidy + definite_fees)
         
+        weights, total_weight, donation_weight = tracker.get_cumulative_weights(share_data['previous_share_hash'],
+            min(height, net.REAL_CHAIN_LENGTH),
+            65535*net.SPREAD*bitcoin_data.target_to_average_attempts(block_target),
+        )
+        assert total_weight == sum(weights.itervalues()) + donation_weight, (total_weight, sum(weights.itervalues()) + donation_weight)
+        
+        amounts = dict((script, share_data['subsidy']*(199*weight)//(200*total_weight)) for script, weight in weights.iteritems()) # 99.5% goes according to weights prior to this share
+        this_script = bitcoin_data.pubkey_hash_to_script2(share_data['pubkey_hash'])
+        amounts[this_script] = amounts.get(this_script, 0) + share_data['subsidy']//200 # 0.5% goes to block finder
+        amounts[DONATION_SCRIPT] = amounts.get(DONATION_SCRIPT, 0) + share_data['subsidy'] - sum(amounts.itervalues()) # all that's left over is the donation weight and some extra satoshis due to rounding
+        
+        if sum(amounts.itervalues()) != share_data['subsidy'] or any(x < 0 for x in amounts.itervalues()):
+            raise ValueError()
+        
+        dests = sorted(amounts.iterkeys(), key=lambda script: (script == DONATION_SCRIPT, amounts[script], script))[-4000:] # block length limit, unlikely to ever be hit
+        
         share_info = dict(
             share_data=share_data,
             far_share_hash=None if last is None and height < 99 else tracker.get_nth_parent_hash(share_data['previous_share_hash'], 99),
@@ -199,8 +199,8 @@ class Share(object):
         )
         
         def get_share(header, last_txout_nonce=last_txout_nonce):
-            min_header=dict(header);del min_header['merkle_root']
-            return cls(net, None, dict(
+            min_header = dict(header); del min_header['merkle_root']
+            share = cls(net, None, dict(
                 min_header=min_header,
                 share_info=share_info,
                 ref_merkle_link=dict(branch=[], index=0),
@@ -208,6 +208,8 @@ class Share(object):
                 hash_link=prefix_to_hash_link(bitcoin_data.tx_type.pack(gentx)[:-32-4-4], cls.gentx_before_refhash),
                 merkle_link=bitcoin_data.calculate_merkle_link([None] + other_transaction_hashes, 0),
             ))
+            assert share.header == header # checks merkle_root
+            return share
         
         return share_info, gentx, other_transaction_hashes, get_share
     
@@ -345,7 +347,7 @@ class Share(object):
         
         other_txs = self._get_other_txs(tracker, known_txs)
         if other_txs is None:
-            if self.time_seen == 0: # ignore if loaded from ShareStore
+            if self.time_seen != 0: # ignore if loaded from ShareStore
                 return True, 'not all txs present'
         else:
             all_txs_size = sum(bitcoin_data.tx_type.packed_size(tx) for tx in other_txs)
@@ -593,7 +595,7 @@ def get_warnings(tracker, best_share, net, bitcoind_warning, bitcoind_work_value
     desired_version_counts = get_desired_version_counts(tracker, best_share,
         min(net.CHAIN_LENGTH, 60*60//net.SHARE_PERIOD, tracker.get_height(best_share)))
     majority_desired_version = max(desired_version_counts, key=lambda k: desired_version_counts[k])
-    if majority_desired_version > 10 and desired_version_counts[majority_desired_version] > sum(desired_version_counts.itervalues())/2:
+    if majority_desired_version > 11 and desired_version_counts[majority_desired_version] > sum(desired_version_counts.itervalues())/2:
         res.append('A MAJORITY OF SHARES CONTAIN A VOTE FOR AN UNSUPPORTED SHARE IMPLEMENTATION! (v%i with %i%% support)\n'
             'An upgrade is likely necessary. Check http://p2pool.forre.st/ for more information.' % (
                 majority_desired_version, 100*desired_version_counts[majority_desired_version]/sum(desired_version_counts.itervalues())))
