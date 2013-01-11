@@ -257,7 +257,7 @@ class Protocol(p2protocol.Protocol):
         ('shares', pack.ListType(p2pool_data.share_type)),
     ])
     def handle_shares(self, shares):
-        self.node.handle_shares([p2pool_data.load_share(share, self.node.net, self) for share in shares if share['type'] >= 9], self)
+        self.node.handle_shares([p2pool_data.load_share(share, self.node.net, self.addr) for share in shares if share['type'] >= 9], self)
     
     def sendShares(self, shares, tracker, known_txs, include_txs_with=[]):
         if not shares:
@@ -634,7 +634,8 @@ class Node(object):
             old_services, old_first_seen, old_last_seen = self.addr_store[host, port]
             self.addr_store[host, port] = services, old_first_seen, max(old_last_seen, timestamp)
         else:
-            self.addr_store[host, port] = services, timestamp, timestamp
+            if len(self.addr_store) < 10000:
+                self.addr_store[host, port] = services, timestamp, timestamp
     
     def handle_shares(self, shares, peer):
         print 'handle_shares', (shares, peer)
